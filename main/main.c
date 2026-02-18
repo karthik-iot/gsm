@@ -22,7 +22,10 @@
 /* ── HTTPS test endpoint ─────────────────────────────────────────── */
 #define HTTPS_URL          "https://rbaskets.in/GSM"
 #define HTTPS_URL_FALLBACK "https://httpbin.org/post"
-#define HTTPS_BODY         "{\"device\":\"esp32\",\"sensor\":\"temperature\",\"value\":25.5}"
+
+/* ── Stress test payload sizes (bytes) ───────────────────────────── */
+static const int payload_sizes[] = { 100, 256, 512, 1024, 2048, 4096, 8192 };
+#define NUM_TESTS (sizeof(payload_sizes) / sizeof(payload_sizes[0]))
 
 static gsm_handle_t modem = NULL;
 
@@ -159,50 +162,105 @@ static bool step_activate_pdp(void)
     return false;
 }
 
-/* ── Step 7: Perform HTTPS POST ──────────────────────────────────── */
-static bool do_https_post(const char *url)
+/* ── Step 7: HTTPS POST stress test ──────────────────────────────── */
+
+/**
+ * Build a JSON payload of approximately `target_size` bytes:
+ * {"test":"stress","seq":<n>,"size":<s>,"data":"AAAA..."}
+ */
+static char *build_json_payload(int seq, int target_size)
 {
-    ESP_LOGI(TAG, "  URL:  %s", url);
-    ESP_LOGI(TAG, "  Body: %s", HTTPS_BODY);
+    char *buf = malloc(target_size + 1);
+    if (!buf) return NULL;
 
-    char response[2048] = {0};
+    /* Write the JSON envelope, leave room for the "data" field */
+    int header_len = snprintf(buf, target_size + 1,
+        "{\"test\":\"stress\",\"seq\":%d,\"size\":%d,\"data\":\"", seq, target_size);
 
-    int64_t start_us = esp_timer_get_time();
+    /* 2 chars for closing "} */
+    int pad_len = target_size - header_len - 2;
+    if (pad_len < 0) pad_len = 0;
 
-    gsm_err_t err = gsm_https_post(
-        modem,
-        url,
-        HTTPS_BODY,
-        response, sizeof(response),
-        NULL, 0
-    );
+    memset(buf + header_len, 'A', pad_len);
+    buf[header_len + pad_len] = '"';
+    buf[header_len + pad_len + 1] = '}';
+    buf[header_len + pad_len + 2] = '\0';
 
-    int elapsed_s = (int)((esp_timer_get_time() - start_us) / 1000000);
-
-    if (err == GSM_OK) {
-        ESP_LOGI(TAG, "HTTPS POST success! (took %d s)", elapsed_s);
-        ESP_LOGI(TAG, "Response:\n%s", response);
-        return true;
-    }
-
-    ESP_LOGE(TAG, "HTTPS POST failed with error: %d (took %d s)", err, elapsed_s);
-    return false;
+    return buf;
 }
 
-static bool step_https_post(void)
-{
-    ESP_LOGI(TAG, "──── Step 7: HTTPS POST ────");
+/* Results for summary table */
+typedef struct {
+    int    size;
+    int    time_s;
+    bool   ok;
+    int    err_code;
+} test_result_t;
 
-    /* Try primary endpoint */
-    ESP_LOGI(TAG, "Trying primary: %s", HTTPS_URL);
-    if (do_https_post(HTTPS_URL)) {
-        return true;
+static test_result_t results[NUM_TESTS];
+
+static void step_stress_test(void)
+{
+    ESP_LOGI(TAG, "──── Step 7: HTTPS POST Stress Test ────");
+    ESP_LOGI(TAG, "  Endpoint: %s", HTTPS_URL);
+    ESP_LOGI(TAG, "  Tests: %d payloads (100B → 8KB)\n", (int)NUM_TESTS);
+
+    char response[512] = {0};
+
+    for (int i = 0; i < (int)NUM_TESTS; i++) {
+        int size = payload_sizes[i];
+
+        ESP_LOGI(TAG, "━━━ Test %d/%d — Payload: %d bytes ━━━", i + 1, (int)NUM_TESTS, size);
+
+        char *body = build_json_payload(i + 1, size);
+        if (!body) {
+            ESP_LOGE(TAG, "  malloc failed for %d bytes", size);
+            results[i] = (test_result_t){ .size = size, .time_s = 0, .ok = false, .err_code = -99 };
+            continue;
+        }
+
+        memset(response, 0, sizeof(response));
+
+        int64_t start_us = esp_timer_get_time();
+
+        gsm_err_t err = gsm_https_post(modem, HTTPS_URL, body,
+                                        response, sizeof(response), NULL, 0);
+
+        int elapsed_s = (int)((esp_timer_get_time() - start_us) / 1000000);
+
+        free(body);
+
+        results[i] = (test_result_t){ .size = size, .time_s = elapsed_s, .ok = (err == GSM_OK), .err_code = err };
+
+        if (err == GSM_OK) {
+            ESP_LOGI(TAG, "  OK  %d bytes in %d s", size, elapsed_s);
+        } else {
+            ESP_LOGE(TAG, "  FAIL  %d bytes — error %d in %d s", size, err, elapsed_s);
+        }
+
+        /* Brief pause between tests */
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 
-    /* Fallback to httpbin */
-    ESP_LOGW(TAG, "Primary failed, trying fallback: %s", HTTPS_URL_FALLBACK);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    return do_https_post(HTTPS_URL_FALLBACK);
+    /* ── Summary table ────────────────────────────────────────────── */
+    ESP_LOGI(TAG, "\n╔══════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║       HTTPS POST Stress Test Results     ║");
+    ESP_LOGI(TAG, "╠══════════╦══════════╦══════════╦═════════╣");
+    ESP_LOGI(TAG, "║  Size    ║  Time(s) ║  Status  ║  Error  ║");
+    ESP_LOGI(TAG, "╠══════════╬══════════╬══════════╬═════════╣");
+
+    int pass = 0, fail = 0;
+    for (int i = 0; i < (int)NUM_TESTS; i++) {
+        ESP_LOGI(TAG, "║  %5d B ║  %5d   ║  %s   ║  %4d   ║",
+                 results[i].size,
+                 results[i].time_s,
+                 results[i].ok ? " OK " : "FAIL",
+                 results[i].err_code);
+        if (results[i].ok) pass++; else fail++;
+    }
+
+    ESP_LOGI(TAG, "╚══════════╩══════════╩══════════╩═════════╝");
+    ESP_LOGI(TAG, "  Passed: %d/%d   Failed: %d/%d", pass, (int)NUM_TESTS, fail, (int)NUM_TESTS);
 }
 
 /* ── Main ────────────────────────────────────────────────────────── */
@@ -228,12 +286,8 @@ void app_main(void)
     /* Step 6: PDP context */
     if (!step_activate_pdp()) return;
 
-    /* Step 7: HTTPS POST */
-    if (step_https_post()) {
-        ESP_LOGI(TAG, "\n=== ALL STEPS PASSED — HTTPS POST WORKING! ===");
-    } else {
-        ESP_LOGE(TAG, "\n=== HTTPS POST FAILED ===");
-    }
+    /* Step 7: HTTPS POST stress test (100B → 8KB) */
+    step_stress_test();
 
     /* Cleanup */
     gsm_deactivate_pdp(modem, 1);
