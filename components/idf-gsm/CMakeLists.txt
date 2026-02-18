@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "src/gsm_core.c"
+        "src/gsm_network.c"
+        "src/gsm_http.c"
+        "src/gsm_mqtt.c"
+        "src/gsm_tcp.c"
+        "src/gsm_sms.c"
+        "src/gsm_gnss.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+    REQUIRES
+        driver
+)
