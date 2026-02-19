@@ -334,6 +334,40 @@ The HTTPS POST time includes:
 - Server processing -- ~1s
 - Response download -- ~1s
 
+### Why does POST time increase with payload size?
+
+The base ~10s is **fixed overhead** — the same regardless of payload size:
+
+```
+┌─────────────────────────────────────────────────────┐
+│          HTTPS POST Time Breakdown (16KB)            │
+├─────────────────────────────┬───────────────────────┤
+│  Phase                      │  Time                 │
+├─────────────────────────────┼───────────────────────┤
+│  DNS resolution             │  ~1s       (fixed)    │
+│  TLS/SSL handshake          │  ~3-4s     (fixed)    │
+│  LTE radio + TCP setup      │  ~1-2s     (fixed)    │
+│  AT command round-trips     │  ~2-3s     (fixed)    │
+│  UART: ESP32 → modem        │  ~1.4s     (scales)   │
+│  TLS encrypt + LTE upload   │  ~1-2s     (scales)   │
+│  Server receive + respond   │  ~1s       (scales)   │
+├─────────────────────────────┼───────────────────────┤
+│  TOTAL                      │  ~13s                 │
+└─────────────────────────────┴───────────────────────┘
+```
+
+**Fixed overhead (~10s)** — dominates the total time:
+- DNS lookup, TLS handshake, and TCP connection setup happen once per request
+- AT command exchanges (QHTTPCFG, QHTTPURL, QHTTPPOST, QHTTPREAD) add ~2-3s of UART back-and-forth
+- Even a 100-byte POST takes ~10s because of this setup cost
+
+**Scaling portion (+1-3s for larger payloads):**
+- **UART transfer:** At 115200 baud (~11.5 KB/s), pushing 16KB from ESP32 to modem takes ~1.4s. For 100B it's <10ms — negligible.
+- **TLS encryption:** The modem's CPU must encrypt larger payloads, and may split them across multiple TLS records.
+- **LTE upload:** More data = more radio frames over the air interface.
+
+This is why the time scaling is very gentle — only **+3s for a 160x increase** in payload size (100B → 16KB). The connection setup dominates, not the data transfer.
+
 ### Stress test results (with custom headers, 8/8 pass)
 
 ```
