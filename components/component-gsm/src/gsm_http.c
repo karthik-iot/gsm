@@ -5,24 +5,88 @@
 
 #include "gsm_private.h"
 
-/* ── Internal: send custom headers ────────────────────────────────── */
+/* ── URL parsing helper ──────────────────────────────────────────── */
 
-static void send_http_headers(gsm_handle_t m, const char *headers[], size_t count)
+static void parse_url_parts(const char *url, char *host, size_t host_len,
+                            char *path, size_t path_len)
 {
-    if (!headers || count == 0) return;
+    const char *p = url;
+    if (strncmp(p, "https://", 8) == 0) p += 8;
+    else if (strncmp(p, "http://", 7) == 0) p += 7;
 
-    ESP_LOGD(GSM_TAG, "Setting custom HTTP headers");
-    if (!gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",1", "OK", 1000)) {
-        ESP_LOGW(GSM_TAG, "Failed to enable custom headers");
-        return;
+    const char *slash = strchr(p, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - p);
+        if (n >= host_len) n = host_len - 1;
+        memcpy(host, p, n);
+        host[n] = '\0';
+        strncpy(path, slash, path_len - 1);
+        path[path_len - 1] = '\0';
+    } else {
+        strncpy(host, p, host_len - 1);
+        host[host_len - 1] = '\0';
+        path[0] = '/';
+        path[1] = '\0';
     }
+}
 
-    char cmd[256];
+/* ── Calculate raw HTTP header block size ────────────────────────── */
+
+static size_t calc_header_size(const char *method, const char *host,
+                               const char *path,
+                               const char *headers[], size_t count,
+                               size_t body_len)
+{
+    size_t total = 0;
+
+    /* "POST /path HTTP/1.1\r\n" */
+    total += strlen(method) + 1 + strlen(path) + 11;
+
+    /* "Host: <host>\r\n" */
+    total += 6 + strlen(host) + 2;
+
+    /* Custom headers, each with \r\n */
     for (size_t i = 0; i < count; i++) {
-        if (!headers[i] || !headers[i][0]) continue;
-        snprintf(cmd, sizeof(cmd), "AT+QHTTPCFG=\"header\",\"%s\\r\\n\"", headers[i]);
-        gsm_send_at(m, cmd, "OK", 1000);
+        if (headers[i] && headers[i][0])
+            total += strlen(headers[i]) + 2;
     }
+
+    /* "Content-Length: <N>\r\n" */
+    char cl[32];
+    total += snprintf(cl, sizeof(cl), "Content-Length: %d\r\n", (int)body_len);
+
+    /* Empty line separating headers from body */
+    total += 2;
+
+    return total;
+}
+
+/* ── Write raw HTTP headers over UART ────────────────────────────── */
+
+static void write_raw_headers(gsm_handle_t m, const char *method,
+                              const char *host, const char *path,
+                              const char *headers[], size_t count,
+                              size_t body_len)
+{
+    char line[300];
+
+    snprintf(line, sizeof(line), "%s %s HTTP/1.1\r\n", method, path);
+    gsm_uart_write(m, line, strlen(line));
+
+    snprintf(line, sizeof(line), "Host: %s\r\n", host);
+    gsm_uart_write(m, line, strlen(line));
+
+    for (size_t i = 0; i < count; i++) {
+        if (headers[i] && headers[i][0]) {
+            gsm_uart_write(m, headers[i], strlen(headers[i]));
+            gsm_uart_write(m, "\r\n", 2);
+        }
+    }
+
+    snprintf(line, sizeof(line), "Content-Length: %d\r\n", (int)body_len);
+    gsm_uart_write(m, line, strlen(line));
+
+    gsm_uart_write(m, "\r\n", 2);
 }
 
 /* ── Internal: extract HTTP body from +QHTTPREAD response ─────────── */
@@ -69,7 +133,16 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
                             const char *headers[], size_t header_count,
                             bool ssl, bool is_post)
 {
-    /* Flush any leftover data from previous requests */
+    bool has_headers = (headers && header_count > 0);
+    char host[128] = {0};
+    char path_buf[256] = {0};
+
+    if (has_headers) {
+        parse_url_parts(url, host, sizeof(host), path_buf, sizeof(path_buf));
+    }
+
+    /* Stop any lingering HTTP session and flush */
+    gsm_send_at(m, "AT+QHTTPSTOP", "OK", 1000);
     gsm_flush_input(m);
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -87,8 +160,10 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
         }
     }
 
-    /* Custom headers */
-    send_http_headers(m, headers, header_count);
+    /* Enable raw request header mode if custom headers provided */
+    if (has_headers) {
+        gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",1", "OK", 1000);
+    }
 
     /* Set URL */
     char cmd[64];
@@ -117,8 +192,15 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
 
     /* POST or GET */
     if (is_post) {
-        size_t data_len = data ? strlen(data) : 0;
-        snprintf(cmd, sizeof(cmd), "AT+QHTTPPOST=%d,10,30", (int)data_len);
+        size_t body_len = data ? strlen(data) : 0;
+        size_t total_len = body_len;
+
+        if (has_headers) {
+            total_len += calc_header_size("POST", host, path_buf,
+                                          headers, header_count, body_len);
+        }
+
+        snprintf(cmd, sizeof(cmd), "AT+QHTTPPOST=%d,10,60", (int)total_len);
 
         if (!gsm_send_at(m, cmd, "CONNECT", 5000)) {
             gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",0", "OK", 1000);
@@ -126,8 +208,14 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
             return GSM_ERR_HTTP_POST;
         }
 
-        if (data && data_len > 0) {
-            gsm_uart_write(m, data, data_len);
+        /* When requestheader=1, prepend raw HTTP headers before body */
+        if (has_headers) {
+            write_raw_headers(m, "POST", host, path_buf,
+                              headers, header_count, body_len);
+        }
+
+        if (data && body_len > 0) {
+            gsm_uart_write(m, data, body_len);
         }
 
         if (!gsm_expect_urc(m, "OK", 5000)) {
@@ -136,7 +224,7 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
             return GSM_ERR_HTTP_POST_DATA;
         }
 
-        if (!gsm_expect_urc(m, "+QHTTPPOST:", 15000)) {
+        if (!gsm_expect_urc(m, "+QHTTPPOST:", 60000)) {
             gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",0", "OK", 1000);
             m->last_error = GSM_ERR_HTTP_POST_URC;
             return GSM_ERR_HTTP_POST_URC;

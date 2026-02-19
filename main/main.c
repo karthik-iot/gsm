@@ -21,10 +21,11 @@
 
 /* ── HTTPS test endpoint ─────────────────────────────────────────── */
 #define HTTPS_URL          "https://rbaskets.in/GSM"
+// #define HTTPS_URL          "https://demo.iotready.co/api/method/otp.api.insert_iot_event"
 #define HTTPS_URL_FALLBACK "https://httpbin.org/post"
 
 /* ── Stress test payload sizes (bytes) ───────────────────────────── */
-static const int payload_sizes[] = { 100, 256, 512, 1024, 2048, 4096, 8192 };
+static const int payload_sizes[] = { 100, 256, 512, 1024, 2048, 4096, 8192, 16384 };
 #define NUM_TESTS (sizeof(payload_sizes) / sizeof(payload_sizes[0]))
 
 static gsm_handle_t modem = NULL;
@@ -124,9 +125,16 @@ static bool step_wait_network(void)
 /* ── Step 5: Attach GPRS data + set APN ──────────────────────────── */
 static bool step_attach_data(void)
 {
-    ESP_LOGI(TAG, "──── Step 5: Attach GPRS data (APN: %s) ────", GSM_APN);
+    /* Try to read the APN already configured in the modem */
+    char apn[64] = {0};
+    if (gsm_get_apn(modem, apn, sizeof(apn)) && apn[0]) {
+        ESP_LOGI(TAG, "──── Step 5: Attach GPRS data (APN from modem: %s) ────", apn);
+    } else {
+        strncpy(apn, GSM_APN, sizeof(apn) - 1);
+        ESP_LOGI(TAG, "──── Step 5: Attach GPRS data (APN fallback: %s) ────", apn);
+    }
 
-    if (gsm_attach_data(modem, GSM_APN, GSM_APN_USER, GSM_APN_PASS, GSM_APN_AUTH)) {
+    if (gsm_attach_data(modem, apn, GSM_APN_USER, GSM_APN_PASS, GSM_APN_AUTH)) {
         ESP_LOGI(TAG, "GPRS attached OK");
         return true;
     }
@@ -140,8 +148,12 @@ static bool step_activate_pdp(void)
 {
     ESP_LOGI(TAG, "──── Step 6: Activate PDP context ────");
 
-    /* Configure context 1 with APN */
-    gsm_configure_context(modem, 1, 1, GSM_APN, GSM_APN_USER, GSM_APN_PASS, GSM_APN_AUTH);
+    /* Configure context 1 with APN (auto-detect or fallback) */
+    char apn[64] = {0};
+    if (!gsm_get_apn(modem, apn, sizeof(apn)) || !apn[0]) {
+        strncpy(apn, GSM_APN, sizeof(apn) - 1);
+    }
+    gsm_configure_context(modem, 1, 1, apn, GSM_APN_USER, GSM_APN_PASS, GSM_APN_AUTH);
 
     if (gsm_activate_pdp(modem, 1)) {
         ESP_LOGI(TAG, "PDP context 1 activated!");
@@ -223,8 +235,20 @@ static void step_stress_test(void)
 
         int64_t start_us = esp_timer_get_time();
 
-        gsm_err_t err = gsm_https_post(modem, HTTPS_URL, body,
-                                        response, sizeof(response), NULL, 0);
+        const char *headers[] = {
+            "Authorization: token 85edb3505942b22:849382fae8e94e2",
+            "Content-Type: application/json"
+        };
+        size_t header_count = sizeof(headers) / sizeof(headers[0]);
+
+        gsm_err_t err;
+        if (strncmp(HTTPS_URL, "https://", 8) == 0) {
+            err = gsm_https_post(modem, HTTPS_URL, body,
+                                 response, sizeof(response), headers, header_count);
+        } else {
+            err = gsm_http_post(modem, HTTPS_URL, body,
+                                response, sizeof(response), headers, header_count);
+        }
 
         int elapsed_s = (int)((esp_timer_get_time() - start_us) / 1000000);
 

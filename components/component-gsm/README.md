@@ -31,13 +31,27 @@ void app_main(void)
     gsm_init(&cfg, &modem);
     gsm_begin(modem);
 
-    // Connect to network
+    // Connect to network (auto-detect APN from SIM, fallback to manual)
     gsm_wait_for_network(modem, 60000);
-    gsm_attach_data(modem, "your_apn", "", "", 0);
+    char apn[64];
+    if (!gsm_get_apn(modem, apn, sizeof(apn)) || !apn[0]) {
+        strcpy(apn, "your_apn");  // fallback
+    }
+    gsm_attach_data(modem, apn, "", "", 0);
+    gsm_configure_context(modem, 1, 1, apn, "", "", 0);
     gsm_activate_pdp(modem, 1);
 
-    // HTTP GET
+    // HTTPS POST with custom headers (Authorization, Content-Type)
     char resp[1024];
+    const char *headers[] = {
+        "Authorization: token apikey:secret",
+        "Content-Type: application/json"
+    };
+    gsm_https_post(modem, "https://example.com/api",
+                   "{\"key\":\"value\"}", resp, sizeof(resp),
+                   headers, 2);
+
+    // HTTP GET (no custom headers)
     gsm_http_get(modem, "http://example.com/api", resp, sizeof(resp), NULL, 0);
 
     // MQTT
@@ -77,7 +91,7 @@ Default pins and baud rate can be changed via `idf.py menuconfig` under **GSM Mo
 | Lifecycle  | `gsm_init`, `gsm_begin`, `gsm_deinit`, `gsm_reboot`, `gsm_power_off` |
 | AT engine  | `gsm_send_at`, `gsm_send_at_raw`, `gsm_read_response`               |
 | SIM/Info   | `gsm_is_sim_ready`, `gsm_get_imei`, `gsm_get_signal_strength`, `gsm_get_operator` |
-| Network    | `gsm_set_apn`, `gsm_wait_for_network`, `gsm_attach_data`, `gsm_activate_pdp` |
+| Network    | `gsm_set_apn`, `gsm_get_apn`, `gsm_wait_for_network`, `gsm_attach_data`, `gsm_activate_pdp` |
 | HTTP/S     | `gsm_http_get`, `gsm_http_post`, `gsm_https_get`, `gsm_https_post`  |
 | MQTT       | `gsm_mqtt_connect`, `gsm_mqtt_publish`, `gsm_mqtt_subscribe`        |
 | TCP        | `gsm_tcp_open`, `gsm_tcp_send`, `gsm_tcp_recv`, `gsm_tcp_close`     |

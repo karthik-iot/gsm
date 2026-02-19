@@ -1,5 +1,100 @@
 # Changelog
 
+## Custom Headers, Auto APN, Session Cleanup (2026-02-19)
+
+### Custom HTTP Headers (requestheader=1)
+
+**Problem:** `AT+QHTTPCFG="header","..."` is NOT a valid Quectel AT command. The modem
+silently accepts it but does nothing — headers were never sent, causing `400 Bad Request`.
+
+**Fix:** When custom headers are provided, the library now:
+1. Enables `AT+QHTTPCFG="requestheader",1`
+2. Parses the URL into host and path components
+3. Prepends the full raw HTTP request (request line + headers + body) to the POST data
+4. Calculates the total byte count (headers + body) for `AT+QHTTPPOST=<total_len>`
+
+**New helpers in `gsm_http.c`:**
+- `parse_url_parts()` — extracts host and path from URL
+- `calc_header_size()` — calculates byte size of the raw HTTP header block
+- `write_raw_headers()` — writes request line + Host + custom headers + Content-Length over UART
+
+**What the modem now sends (with requestheader=1):**
+```
+POST /api/endpoint HTTP/1.1\r\n
+Host: example.com\r\n
+Authorization: token xxx:yyy\r\n
+Content-Type: application/json\r\n
+Content-Length: 100\r\n
+\r\n
+{"key":"value",...}
+```
+
+When no headers are provided (`NULL, 0`), the library works exactly as before —
+`requestheader` stays off and only the body is sent.
+
+---
+
+### Auto-detect APN from SIM
+
+**New function:** `gsm_get_apn(modem, buf, len)` in `gsm_network.c`
+
+Queries the modem with `AT+CGDCONT?` to read the APN configured by the SIM/network.
+Falls back to the hardcoded `GSM_APN` define if the modem returns nothing.
+
+This means you can swap SIMs (Jio → Airtel, etc.) without changing code.
+
+---
+
+### HTTP Session Cleanup (AT+QHTTPSTOP)
+
+**Problem:** After a failed/timed-out request, the modem's HTTP engine stays busy.
+Subsequent requests fail with `CME ERROR: 711` (HTTP busy).
+
+**Fix:** `AT+QHTTPSTOP` is now sent before every new request to cancel any lingering
+session. Combined with `gsm_flush_input()` to clear stale UART data.
+
+---
+
+### Increased POST URC Timeout
+
+**Before:** `gsm_expect_urc("+QHTTPPOST:", 15000)` — 15 seconds
+**After:** `gsm_expect_urc("+QHTTPPOST:", 60000)` — 60 seconds
+
+Also increased `AT+QHTTPPOST` server response timeout from 30s to 60s to match.
+
+Larger payloads (4KB+) and slower networks can take more than 15s for the server
+to respond. The 60s timeout prevents false `-17` (POST_URC) failures.
+
+---
+
+### HTTP/HTTPS Auto-select
+
+`main.c` now compares the URL prefix to call the right function:
+```c
+if (strncmp(url, "https://", 8) == 0)
+    gsm_https_post(...)
+else
+    gsm_http_post(...)
+```
+
+---
+
+### Stress Test Results (8/8 pass)
+
+```
+║    100 B ║     10s  ║   OK   ║
+║    256 B ║     10s  ║   OK   ║
+║    512 B ║     10s  ║   OK   ║
+║   1024 B ║     10s  ║   OK   ║
+║   2048 B ║     11s  ║   OK   ║
+║   4096 B ║     11s  ║   OK   ║
+║   8192 B ║     12s  ║   OK   ║
+║  16384 B ║     13s  ║   OK   ║
+  Passed: 8/8
+```
+
+---
+
 ## HTTP Performance Optimization (2026-02-18)
 
 ### Problem

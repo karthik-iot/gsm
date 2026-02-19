@@ -44,6 +44,17 @@ bool gsm_set_apn(gsm_handle_t m, const char *apn)
     return false;
 }
 
+bool gsm_get_apn(gsm_handle_t m, char *buf, size_t len)
+{
+    gsm_flush_input(m);
+    gsm_uart_writeln(m, "AT+CGDCONT?");
+    char resp[256];
+    gsm_read_response(m, resp, sizeof(resp), 2000);
+
+    /* Response: +CGDCONT: 1,"IP","airtelgprs.com",...  */
+    return gsm_extract_quoted(resp, "+CGDCONT:", buf, len);
+}
+
 bool gsm_wait_for_network(gsm_handle_t m, uint32_t timeout_ms)
 {
     int64_t start = esp_timer_get_time() / 1000;

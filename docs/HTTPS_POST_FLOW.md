@@ -105,11 +105,14 @@ How an ESP32 talks to a Quectel EC200U modem to make an HTTPS POST request over 
   +=========================================================================+
 
   +=========================================================================+
-  |  PHASE 6: HTTPS POST                                                    |
+  |  PHASE 6: HTTPS POST (with custom headers)                              |
   +=========================================================================+
   |                                                                         |
-  |  6a. Configure HTTP                                                     |
-  |  ------------------                                                     |
+  |  6a. Stop previous session & configure HTTP                             |
+  |  ------------------------------------------                             |
+  |  AT+QHTTPSTOP ----------->  "Cancel any lingering HTTP session"         |
+  |  <------------------------ OK                                           |
+  |                                                                         |
   |  AT+QHTTPCFG=              "Use data connection #1 for HTTP"            |
   |    "contextid",1 -------->                                              |
   |  <------------------------ OK                                           |
@@ -118,22 +121,39 @@ How an ESP32 talks to a Quectel EC200U modem to make an HTTPS POST request over 
   |    "sslctxid",1 --------->                                              |
   |  <------------------------ OK                                           |
   |                                                                         |
-  |  6b. Set the URL                                                        |
-  |  ----------------                                                       |
-  |  AT+QHTTPURL=25,10 ----->  "I'm going to send you a URL that           |
-  |  <------------------------ CONNECT  is 25 characters long"              |
-  |                                                                         |
-  |  https://rbaskets.in/GSM >  (send the actual URL bytes)                 |
+  |  AT+QHTTPCFG=              "I will provide raw HTTP headers             |
+  |    "requestheader",1 --->   in the POST body"                           |
   |  <------------------------ OK                                           |
   |                                                                         |
-  |  6c. Send POST data                                                     |
-  |  -------------------                                                    |
-  |  AT+QHTTPPOST=             "I'm going to POST 100 bytes.                |
-  |    100,10,30 ------------>  Wait 10s for my data, 30s for server"       |
+  |  6b. Set the URL                                                        |
+  |  ----------------                                                       |
+  |  AT+QHTTPURL=60,10 ----->  "I'm going to send you a URL that           |
+  |  <------------------------ CONNECT  is 60 characters long"              |
+  |                                                                         |
+  |  https://demo.iotready    (send the actual URL bytes)                   |
+  |  .co/api/method/otp.api                                                 |
+  |  .insert_iot_event ------>                                              |
+  |  <------------------------ OK                                           |
+  |                                                                         |
+  |  6c. Send POST data (headers + body)                                    |
+  |  -----------------------------------                                    |
+  |  AT+QHTTPPOST=             "I'm going to POST <total> bytes.            |
+  |    <total>,10,60 -------->  total = header_block + json_body"           |
   |  <------------------------ CONNECT                                      |
   |                                                                         |
-  |  {"test":"stress",         (send the JSON body bytes)                    |
-  |   "data":"AAA..."} ------>                                +----------+  |
+  |  POST /api/method/otp.     ┐                                            |
+  |   api.insert_iot_event     │  Raw HTTP headers prepended                |
+  |   HTTP/1.1\r\n             │  to the body when                          |
+  |  Host: demo.iotready.     │  requestheader=1                           |
+  |   co\r\n                   │                                            |
+  |  Authorization: token      │  The modem sends these                     |
+  |   85edb...:84938...\r\n    │  as-is to the server.                     |
+  |  Content-Type:             │                                            |
+  |   application/json\r\n     │                                            |
+  |  Content-Length: 100\r\n   │                                            |
+  |  \r\n  ------------------->┘                                            |
+  |                                                                         |
+  |  {"key":"value",...} ----->  (JSON body bytes)            +----------+  |
   |  <------------------------ OK  (modem accepted the data)  |          |  |
   |                                                           |  Server  |  |
   |     ... modem sends HTTPS request to server ...  -------->| receives |  |
@@ -152,6 +172,10 @@ How an ESP32 talks to a Quectel EC200U modem to make an HTTPS POST request over 
   |  <------------------------ {"status":"ok","id":"abc123"}                |
   |  <------------------------ OK                                           |
   |  <------------------------ +QHTTPREAD: 0   (read complete)             |
+  |                                                                         |
+  |  AT+QHTTPCFG=              "Reset back to automatic headers"            |
+  |    "requestheader",0 --->                                               |
+  |  <------------------------ OK                                           |
   |                                                                         |
   +=========================================================================+
 
@@ -208,8 +232,9 @@ The modem replies with `OK`, `ERROR`, or data.
 |---------|----------------------|
 | `AT+CGATT?` | **Check data attachment.** Is the modem connected to the mobile data network? 1 = yes, 0 = no. |
 | `AT+CGATT=1` | **Attach to data.** Turn on mobile data. Like switching on "mobile data" on your phone. |
-| `AT+CGDCONT=1,"IP","jionet"` | **Set APN.** APN = Access Point Name. It's like a gateway address that your SIM provider gives you. For Jio it's `jionet`. For Airtel it's `airtelgprs.com`. Without the right APN, you can't get internet. |
-| `AT+QICSGP=1,1,"jionet","","",0` | **Configure data connection.** Sets the APN along with username, password, and auth type. For Jio there's no username/password needed (empty strings) and no auth (0). |
+| `AT+CGDCONT?` | **Read current APN.** Queries the modem for the APN already configured by the SIM/network. Response: `+CGDCONT: 1,"IP","airtelgprs.com",...`. Used by `gsm_get_apn()` to auto-detect the APN so you can swap SIMs without changing code. |
+| `AT+CGDCONT=1,"IP","<apn>"` | **Set APN.** APN = Access Point Name. It's like a gateway address that your SIM provider gives you. For Jio it's `jionet`. For Airtel it's `airtelgprs.com`. Without the right APN, you can't get internet. Used as fallback if auto-detect returns nothing. |
+| `AT+QICSGP=1,1,"<apn>","","",0` | **Configure data connection.** Sets the APN along with username, password, and auth type. For most Indian carriers there's no username/password needed (empty strings) and no auth (0). |
 
 ### Phase 5: Open Data Pipe (PDP Context)
 
@@ -223,15 +248,33 @@ The modem replies with `OK`, `ERROR`, or data.
 
 | Command | What it does (simple) |
 |---------|----------------------|
+| `AT+QHTTPSTOP` | **Stop HTTP session.** Cancels any lingering HTTP request. Prevents `CME ERROR: 711` (HTTP busy) on back-to-back requests. Sent before every new request. |
 | `AT+QHTTPCFG="contextid",1` | **Link HTTP to data connection.** Tells the HTTP engine "use data connection #1 for your requests." |
 | `AT+QHTTPCFG="sslctxid",1` | **Link HTTPS to SSL.** Tells the HTTP engine to use SSL context #1 for encryption. This is what makes it HTTPS (secure) instead of HTTP. |
+| `AT+QHTTPCFG="requestheader",1` | **Custom headers ON.** Tells the modem "I'll provide raw HTTP headers prepended to the POST body." **Important:** `AT+QHTTPCFG="header"` is NOT a valid command — you must include headers in the POST data itself. |
+| `AT+QHTTPCFG="requestheader",0` | **Custom headers OFF.** Reset back to automatic headers. Sent after each request completes (or fails). |
 | `AT+QHTTPURL=<len>,10` | **Set URL.** Tells the modem "I'm about to send a URL that is `<len>` bytes long. Wait up to 10 seconds for me to send it." Modem replies `CONNECT`, then we send the URL bytes. |
-| `AT+QHTTPPOST=<len>,10,30` | **Start POST.** "I'm going to send `<len>` bytes of data. Wait 10s for my data, then wait 30s for the server to reply." Modem says `CONNECT`, we send the data, then we wait for the result. |
+| `AT+QHTTPPOST=<len>,10,60` | **Start POST.** `<len>` = total bytes (headers + body when `requestheader=1`, or just body when `requestheader=0`). Wait 10s for input, 60s for server reply. Modem says `CONNECT`, we send the data. |
 | _+QHTTPPOST: 0,200,0_ | **POST result (URC).** This is the modem telling us the result. `0` = no error, `200` = HTTP 200 OK (success), `0` = response body length. This comes automatically -- we don't send it. |
 | `AT+QHTTPREAD` | **Read response body.** "Give me whatever the server sent back." The modem sends the response data followed by `+QHTTPREAD: 0` when done. |
 | `AT+QHTTPGET=60` | **Start GET** (for reference). Like POST but simpler -- just downloads a page. The 60 means wait up to 60s for the server. |
-| `AT+QHTTPCFG="requestheader",1` | **Custom headers ON.** Tells the modem "I'll provide my own HTTP headers." We don't use this for our stress test (modem handles headers automatically). |
-| `AT+QHTTPCFG="requestheader",0` | **Custom headers OFF.** Reset back to automatic headers after each request. |
+
+#### How custom headers work (requestheader=1)
+
+When `requestheader=1`, the data sent via `AT+QHTTPPOST` must include raw HTTP headers **prepended** to the body:
+
+```
+POST /api/endpoint HTTP/1.1\r\n        ← request line
+Host: example.com\r\n                  ← required
+Authorization: token xxx:yyy\r\n       ← custom header
+Content-Type: application/json\r\n     ← custom header
+Content-Length: 42\r\n                 ← body size
+\r\n                                   ← empty line = end of headers
+{"key":"value"}                        ← actual JSON body
+```
+
+The `<len>` in `AT+QHTTPPOST=<len>` is the **total** byte count (all headers + separator + body).
+The URL from `AT+QHTTPURL` is still used for the TCP/TLS connection, but the request line in the headers tells the server which path to hit.
 
 ### Other Useful Commands
 
@@ -280,11 +323,27 @@ Only after PDP activation can you actually browse the internet, make HTTP reques
 | Network registration | 2-60 seconds |
 | GPRS attach | 1-10 seconds |
 | PDP activation | 1-15 seconds |
-| **Single HTTPS POST** | **10-11 seconds** |
+| **HTTPS POST (100B-2KB)** | **10-11 seconds** |
+| **HTTPS POST (4KB-8KB)** | **11-12 seconds** |
+| **HTTPS POST (16KB)** | **13 seconds** |
 
 The HTTPS POST time includes:
 - TLS/SSL handshake (encryption setup) -- ~3-4s
 - DNS resolution -- ~1s
-- Data upload over LTE -- ~1-2s
+- Data upload over LTE -- ~1-2s (scales with payload size)
 - Server processing -- ~1s
 - Response download -- ~1s
+
+### Stress test results (with custom headers, 8/8 pass)
+
+```
+║    100 B ║     10s  ║   OK   ║
+║    256 B ║     10s  ║   OK   ║
+║    512 B ║     10s  ║   OK   ║
+║   1024 B ║     10s  ║   OK   ║
+║   2048 B ║     11s  ║   OK   ║
+║   4096 B ║     11s  ║   OK   ║
+║   8192 B ║     12s  ║   OK   ║
+║  16384 B ║     13s  ║   OK   ║
+  Passed: 8/8
+```

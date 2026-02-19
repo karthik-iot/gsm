@@ -153,6 +153,9 @@ int gsm_get_registration_status(gsm_handle_t modem, bool eps);
 
 /* ── Network / PDP ────────────────────────────────────────────────── */
 bool gsm_set_apn(gsm_handle_t modem, const char *apn);
+
+/** Read the currently configured APN from the modem into buf. Returns true on success. */
+bool gsm_get_apn(gsm_handle_t modem, char *buf, size_t len);
 bool gsm_wait_for_network(gsm_handle_t modem, uint32_t timeout_ms);
 bool gsm_attach_data(gsm_handle_t modem, const char *apn, const char *user, const char *pass, int auth);
 bool gsm_activate_pdp(gsm_handle_t modem, int ctx_id);
