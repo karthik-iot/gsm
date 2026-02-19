@@ -141,6 +141,16 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
         parse_url_parts(url, host, sizeof(host), path_buf, sizeof(path_buf));
     }
 
+#ifdef GSM_LOG_HTTP_TIMING
+    int64_t t_start = esp_timer_get_time();
+    int64_t t_phase;
+#endif
+
+    /* ── Phase 1: AT command setup ─────────────────────────────────── */
+#ifdef GSM_LOG_HTTP_TIMING
+    t_phase = esp_timer_get_time();
+#endif
+
     /* Stop any lingering HTTP session and flush */
     gsm_send_at(m, "AT+QHTTPSTOP", "OK", 1000);
     gsm_flush_input(m);
@@ -164,6 +174,16 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
     if (has_headers) {
         gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",1", "OK", 1000);
     }
+
+#ifdef GSM_LOG_HTTP_TIMING
+    ESP_LOGI(GSM_TAG, "[HTTP] Phase 1 AT config:  %lld ms",
+             (esp_timer_get_time() - t_phase) / 1000);
+#endif
+
+    /* ── Phase 2: URL setup ────────────────────────────────────────── */
+#ifdef GSM_LOG_HTTP_TIMING
+    t_phase = esp_timer_get_time();
+#endif
 
     /* Set URL */
     char cmd[64];
@@ -190,6 +210,11 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
         return GSM_ERR_HTTP_URL_WRITE;
     }
 
+#ifdef GSM_LOG_HTTP_TIMING
+    ESP_LOGI(GSM_TAG, "[HTTP] Phase 2 URL setup:  %lld ms",
+             (esp_timer_get_time() - t_phase) / 1000);
+#endif
+
     /* POST or GET */
     if (is_post) {
         size_t body_len = data ? strlen(data) : 0;
@@ -208,6 +233,11 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
             return GSM_ERR_HTTP_POST;
         }
 
+        /* ── Phase 3: UART data write ──────────────────────────────── */
+#ifdef GSM_LOG_HTTP_TIMING
+        t_phase = esp_timer_get_time();
+#endif
+
         /* When requestheader=1, prepend raw HTTP headers before body */
         if (has_headers) {
             write_raw_headers(m, "POST", host, path_buf,
@@ -218,17 +248,42 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
             gsm_uart_write(m, data, body_len);
         }
 
+#ifdef GSM_LOG_HTTP_TIMING
+        ESP_LOGI(GSM_TAG, "[HTTP] Phase 3 UART write (%d B): %lld ms",
+                 (int)total_len, (esp_timer_get_time() - t_phase) / 1000);
+#endif
+
+        /* ── Phase 4: Modem accepts data ───────────────────────────── */
+#ifdef GSM_LOG_HTTP_TIMING
+        t_phase = esp_timer_get_time();
+#endif
+
         if (!gsm_expect_urc(m, "OK", 5000)) {
             gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",0", "OK", 1000);
             m->last_error = GSM_ERR_HTTP_POST_DATA;
             return GSM_ERR_HTTP_POST_DATA;
         }
 
+#ifdef GSM_LOG_HTTP_TIMING
+        ESP_LOGI(GSM_TAG, "[HTTP] Phase 4 modem ACK:  %lld ms",
+                 (esp_timer_get_time() - t_phase) / 1000);
+#endif
+
+        /* ── Phase 5: DNS + TLS + upload + server response ─────────── */
+#ifdef GSM_LOG_HTTP_TIMING
+        t_phase = esp_timer_get_time();
+#endif
+
         if (!gsm_expect_urc(m, "+QHTTPPOST:", 60000)) {
             gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",0", "OK", 1000);
             m->last_error = GSM_ERR_HTTP_POST_URC;
             return GSM_ERR_HTTP_POST_URC;
         }
+
+#ifdef GSM_LOG_HTTP_TIMING
+        ESP_LOGI(GSM_TAG, "[HTTP] Phase 5 network RT: %lld ms  (DNS+TLS+upload+server)",
+                 (esp_timer_get_time() - t_phase) / 1000);
+#endif
     } else {
         if (!gsm_send_at(m, "AT+QHTTPGET=60", "OK", 15000)) {
             gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",0", "OK", 1000);
@@ -236,12 +291,26 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
             return GSM_ERR_HTTP_GET;
         }
 
+#ifdef GSM_LOG_HTTP_TIMING
+        t_phase = esp_timer_get_time();
+#endif
+
         if (!gsm_expect_urc(m, "+QHTTPGET:", 20000)) {
             gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",0", "OK", 1000);
             m->last_error = GSM_ERR_HTTP_GET_URC;
             return GSM_ERR_HTTP_GET_URC;
         }
+
+#ifdef GSM_LOG_HTTP_TIMING
+        ESP_LOGI(GSM_TAG, "[HTTP] Phase 5 network RT: %lld ms  (DNS+TLS+download+server)",
+                 (esp_timer_get_time() - t_phase) / 1000);
+#endif
     }
+
+    /* ── Phase 6: Read response body ───────────────────────────────── */
+#ifdef GSM_LOG_HTTP_TIMING
+    t_phase = esp_timer_get_time();
+#endif
 
     /* Read HTTP response body */
     gsm_send_at_raw(m, "AT+QHTTPREAD");
@@ -255,11 +324,21 @@ gsm_err_t gsm_http_request(gsm_handle_t m, const char *url, const char *data,
 
     int n = gsm_collect_response(m, raw, GSM_HTTP_RESP_BUF_SIZE, 10000);
 
+#ifdef GSM_LOG_HTTP_TIMING
+    ESP_LOGI(GSM_TAG, "[HTTP] Phase 6 read resp:  %lld ms",
+             (esp_timer_get_time() - t_phase) / 1000);
+#endif
+
     /* Reset custom headers */
     gsm_send_at(m, "AT+QHTTPCFG=\"requestheader\",0", "OK", 1000);
 
     bool ok = extract_http_payload(raw, n, response, resp_len);
     free(raw);
+
+#ifdef GSM_LOG_HTTP_TIMING
+    ESP_LOGI(GSM_TAG, "[HTTP] ─── TOTAL: %lld ms ───",
+             (esp_timer_get_time() - t_start) / 1000);
+#endif
 
     if (!ok || strstr(response, "ERROR")) {
         m->last_error = GSM_ERR_HTTP_READ;
