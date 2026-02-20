@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "cJSON.h"
 
 #define TAG "gsm-test"
 
@@ -31,10 +32,6 @@
 #define WS_HOST "wstest.iotready.com"
 #define WS_PORT 443
 #define WS_PATH "/ws"
-
-/* ── Stress test payload sizes (bytes) ───────────────────────────── */
-static const int payload_sizes[] = { 100, 256, 512, 1024, 2048, 4096, 8192, 16384 };
-#define NUM_TESTS (sizeof(payload_sizes) / sizeof(payload_sizes[0]))
 
 static gsm_handle_t modem = NULL;
 
@@ -182,7 +179,12 @@ static bool step_activate_pdp(void)
     return false;
 }
 
-/* ── Step 7: HTTPS POST stress test ──────────────────────────────── */
+/* ── Step 7: HTTPS POST stress test (only when TEST_WSS is not set) ── */
+#ifndef TEST_WSS
+
+/* ── Stress test payload sizes (bytes) ───────────────────────────── */
+static const int payload_sizes[] = { 100, 256, 512, 1024, 2048, 4096, 8192, 16384 };
+#define NUM_TESTS (sizeof(payload_sizes) / sizeof(payload_sizes[0]))
 
 /**
  * Build a JSON payload of approximately `target_size` bytes:
@@ -294,6 +296,7 @@ static void step_stress_test(void)
     ESP_LOGI(TAG, "╚══════════╩══════════╩══════════╩═════════╝");
     ESP_LOGI(TAG, "  Passed: %d/%d   Failed: %d/%d", pass, (int)NUM_TESTS, fail, (int)NUM_TESTS);
 }
+#endif /* !TEST_WSS */
 
 /* ── Step 7b: WSS periodic post_log (enabled by #define TEST_WSS) ── */
 #ifdef TEST_WSS
@@ -325,29 +328,54 @@ static void step_wss_post_log(void)
         {
             seq++;
 
-            /* Build payload — JSON header with timing, padded to target size */
-            char *payload = malloc(size + 1);
-            if (!payload) {
-                ESP_LOGE(TAG, "[%d] malloc failed for %d B", seq, size);
-                goto done;
+            /* Build payload using cJSON */
+            cJSON *root = cJSON_CreateObject();
+            if (!root) {
+                ESP_LOGW(TAG, "[%d] cJSON alloc failed — retrying", seq);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
             }
+            cJSON_AddNumberToObject(root, "seq", seq);
+            cJSON_AddNumberToObject(root, "size", size);
+            cJSON_AddNumberToObject(root, "last_send_ms", last_send_ms);
+            cJSON_AddNumberToObject(root, "last_recv_ms", last_recv_ms);
+            cJSON_AddNumberToObject(root, "last_total_ms", last_total_ms);
 
-            int hdr = snprintf(payload, size + 1,
-                "{\"seq\":%d,\"size\":%d,\"last_send_ms\":%d,"
-                "\"last_recv_ms\":%d,\"last_total_ms\":%d,\"data\":\"",
-                seq, size, last_send_ms, last_recv_ms, last_total_ms);
-            int pad = size - hdr - 2;   /* 2 = "} */
-            if (pad < 0) pad = 0;
-            memset(payload + hdr, 'A', pad);
-            payload[hdr + pad]     = '"';
-            payload[hdr + pad + 1] = '}';
-            payload[hdr + pad + 2] = '\0';
+            /* Pad data field to reach target size */
+            char *json_no_pad = cJSON_PrintUnformatted(root);
+            int meta_len = strlen(json_no_pad);
+            cJSON_free(json_no_pad);
+
+            /* overhead: ,"data":"" = 10 chars added by cJSON */
+            int pad_len = size - meta_len - 10;
+            if (pad_len < 1) pad_len = 1;
+
+            char *pad_str = malloc(pad_len + 1);
+            if (!pad_str) {
+                cJSON_Delete(root);
+                ESP_LOGW(TAG, "[%d] pad alloc failed — retrying", seq);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            memset(pad_str, 'A', pad_len);
+            pad_str[pad_len] = '\0';
+
+            cJSON_AddStringToObject(root, "data", pad_str);
+            free(pad_str);
+
+            char *payload = cJSON_PrintUnformatted(root);
+            cJSON_Delete(root);
+            if (!payload) {
+                ESP_LOGW(TAG, "[%d] cJSON print failed — retrying", seq);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
 
             /* Send */
             int64_t ts = esp_timer_get_time();
             gsm_err_t serr = gsm_ws_send_text(modem, 0, payload, 0);
             last_send_ms = (int)((esp_timer_get_time() - ts) / 1000);
-            free(payload);
+            cJSON_free(payload);
 
             if (serr != GSM_OK) {
                 ESP_LOGW(TAG, "[%d] SEND FAIL err=%d (%d B) — continuing", seq, serr, size);
@@ -362,8 +390,11 @@ static void step_wss_post_log(void)
             size_t rbuf_size = (size_t)(size + 64);
             char *rbuf = calloc(1, rbuf_size);
             if (!rbuf) {
-                ESP_LOGE(TAG, "[%d] rbuf malloc failed", seq);
-                goto done;
+                ESP_LOGW(TAG, "[%d] rbuf alloc failed — continuing", seq);
+                last_recv_ms = -1;
+                last_total_ms = -1;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
             }
 
             int64_t tr = esp_timer_get_time();
@@ -386,7 +417,6 @@ static void step_wss_post_log(void)
         }
     }
 
-done:
     gsm_ws_close(modem, 0);
 }
 #endif /* TEST_WSS */

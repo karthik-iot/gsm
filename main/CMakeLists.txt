@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES component-gsm
+    REQUIRES component-gsm component-json
 )
