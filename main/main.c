@@ -301,21 +301,43 @@ static void step_stress_test(void)
 /* ── Step 7b: WSS periodic post_log (enabled by #define TEST_WSS) ── */
 #ifdef TEST_WSS
 
+static bool wss_connect(int *conn_ms)
+{
+    int64_t t0 = esp_timer_get_time();
+    gsm_err_t err = gsm_wss_connect(modem, WS_HOST, WS_PORT, WS_PATH, 1, 0);
+    *conn_ms = (int)((esp_timer_get_time() - t0) / 1000);
+
+    if (err != GSM_OK) {
+        ESP_LOGE(TAG, "  WSS connect FAILED (err=%d, %d ms)", err, *conn_ms);
+        return false;
+    }
+    ESP_LOGI(TAG, "  WSS connected in %d ms", *conn_ms);
+    return true;
+}
+
+static bool wss_reconnect(int *fail_streak)
+{
+    ESP_LOGW(TAG, "  Reconnecting WSS (close → reopen)...");
+    gsm_ws_close(modem, 0);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    int conn_ms;
+    if (wss_connect(&conn_ms)) {
+        *fail_streak = 0;
+        return true;
+    }
+    return false;
+}
+
+#define MAX_SEND_FAILS_BEFORE_RECONNECT 3
+
 static void step_wss_post_log(void)
 {
     ESP_LOGI(TAG, "──── Step 7: WSS Post Log (1 msg/sec) ────");
     ESP_LOGI(TAG, "  Endpoint: wss://%s%s", WS_HOST, WS_PATH);
 
-    /* Connect once */
-    int64_t t0 = esp_timer_get_time();
-    gsm_err_t err = gsm_wss_connect(modem, WS_HOST, WS_PORT, WS_PATH, 1, 0);
-    int conn_ms = (int)((esp_timer_get_time() - t0) / 1000);
-
-    if (err != GSM_OK) {
-        ESP_LOGE(TAG, "  WSS connect FAILED (err=%d, %d ms)", err, conn_ms);
-        return;
-    }
-    ESP_LOGI(TAG, "  WSS connected in %d ms\n", conn_ms);
+    int conn_ms;
+    if (!wss_connect(&conn_ms)) return;
 
     const int size = 8192;
 
@@ -323,10 +345,22 @@ static void step_wss_post_log(void)
     int last_send_ms = 0;
     int last_recv_ms = 0;
     int last_total_ms = 0;
+    int send_fail_streak = 0;
 
     while (1) {
         {
             seq++;
+
+            /* Auto-reconnect after consecutive send failures */
+            if (send_fail_streak >= MAX_SEND_FAILS_BEFORE_RECONNECT) {
+                ESP_LOGW(TAG, "[%d] %d consecutive send failures — reconnecting",
+                         seq, send_fail_streak);
+                if (!wss_reconnect(&send_fail_streak)) {
+                    ESP_LOGE(TAG, "[%d] Reconnect failed — retrying in 5s", seq);
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+            }
 
             /* Build payload using cJSON */
             cJSON *root = cJSON_CreateObject();
@@ -378,13 +412,16 @@ static void step_wss_post_log(void)
             cJSON_free(payload);
 
             if (serr != GSM_OK) {
-                ESP_LOGW(TAG, "[%d] SEND FAIL err=%d (%d B) — continuing", seq, serr, size);
+                send_fail_streak++;
+                ESP_LOGW(TAG, "[%d] SEND FAIL err=%d (%d B) streak=%d — continuing",
+                         seq, serr, size, send_fail_streak);
                 last_send_ms = -1;
                 last_recv_ms = -1;
                 last_total_ms = -1;
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
+            send_fail_streak = 0;
 
             /* Receive echo */
             size_t rbuf_size = (size_t)(size + 64);
