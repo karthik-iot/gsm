@@ -49,6 +49,8 @@ typedef enum {
     GSM_ERR_HTTP_GET              = -18,
     GSM_ERR_HTTP_GET_URC          = -19,
     GSM_ERR_HTTP_READ             = -20,
+    GSM_ERR_WS                    = -30,
+    GSM_ERR_WS_HANDSHAKE          = -31,
     GSM_ERR_MQTT                  = -40,
     GSM_ERR_TCP                   = -50,
     GSM_ERR_SSL                   = -60,
@@ -196,6 +198,43 @@ bool gsm_mqtt_connect(gsm_handle_t modem, const char *server, int port, const ch
 bool gsm_mqtt_publish(gsm_handle_t modem, const char *topic, const char *message);
 bool gsm_mqtt_subscribe(gsm_handle_t modem, const char *topic);
 bool gsm_mqtt_disconnect(gsm_handle_t modem);
+
+/* ── WebSocket ────────────────────────────────────────────────────── */
+
+/**
+ * @brief Open a TCP connection and perform the WebSocket upgrade handshake.
+ * @param host     Server hostname (DNS resolved by modem)
+ * @param port     Server port (typically 80 for ws://, 443 for wss://)
+ * @param path     Resource path (e.g. "/ws", "/socket.io/?EIO=4")
+ * @param ctx_id   PDP context id (usually 1)
+ * @param sock_id  Modem socket id (0-11)
+ * @return GSM_OK on success, GSM_ERR_WS_HANDSHAKE if server rejects upgrade.
+ */
+gsm_err_t gsm_ws_connect(gsm_handle_t modem, const char *host, uint16_t port,
+                          const char *path, int ctx_id, int sock_id);
+
+/** @brief Same as gsm_ws_connect but over SSL/TLS (wss://). */
+gsm_err_t gsm_wss_connect(gsm_handle_t modem, const char *host, uint16_t port,
+                           const char *path, int ctx_id, int sock_id);
+
+gsm_err_t gsm_ws_send_text(gsm_handle_t modem, int sock_id,
+                            const char *msg, size_t len);
+
+gsm_err_t gsm_ws_send_binary(gsm_handle_t modem, int sock_id,
+                              const uint8_t *data, size_t len);
+
+/**
+ * @brief Receive one WebSocket message (blocks up to timeout_ms).
+ *
+ * Automatically responds to PING with PONG.
+ * @return >0 payload bytes copied to buf, 0 if control frame only,
+ *         -1 on error, -2 if server sent a CLOSE frame.
+ */
+int gsm_ws_recv(gsm_handle_t modem, int sock_id, char *buf, size_t buf_len,
+                uint32_t timeout_ms);
+
+gsm_err_t gsm_ws_ping(gsm_handle_t modem, int sock_id);
+gsm_err_t gsm_ws_close(gsm_handle_t modem, int sock_id);
 
 /* ── TCP sockets ──────────────────────────────────────────────────── */
 

@@ -15,7 +15,28 @@ void gsm_flush_input(gsm_handle_t m)
 void gsm_uart_write(gsm_handle_t m, const char *data, size_t len)
 {
 #ifdef GSM_LOG_RAW_UART
-    ESP_LOGI(GSM_TAG, "TX [%d]: %.*s", (int)len, (int)len, data);
+    /* Detect binary: if any byte in first 16 is non-printable, use hex dump */
+    bool binary = false;
+    size_t check = (len < 16) ? len : 16;
+    for (size_t i = 0; i < check; i++) {
+        uint8_t c = (uint8_t)data[i];
+        if (c < 0x20 && c != '\r' && c != '\n' && c != '\t') {
+            binary = true;
+            break;
+        }
+    }
+
+    if (binary) {
+        int show = (len > 32) ? 32 : (int)len;
+        char hex[32 * 3 + 4];
+        for (int i = 0; i < show; i++)
+            sprintf(hex + i * 3, "%02X ", (uint8_t)data[i]);
+        hex[show * 3] = '\0';
+        ESP_LOGI(GSM_TAG, "TX [%d]: %s%s", (int)len, hex,
+                 len > 32 ? "..." : "");
+    } else {
+        ESP_LOGI(GSM_TAG, "TX [%d]: %.*s", (int)len, (int)len, data);
+    }
 #endif
     uart_write_bytes(m->uart_port, data, len);
 }
@@ -48,6 +69,7 @@ int gsm_read_response(gsm_handle_t m, char *buf, size_t buf_len, uint32_t timeou
                 strstr(buf, "\r\nERROR\r\n") ||
                 strstr(buf, "\r\n> ") ||
                 strstr(buf, "+CME ERROR:") ||
+                strstr(buf, "SEND OK") ||
                 strstr(buf, "+QHTTPPOST:") ||
                 strstr(buf, "+QHTTPGET:") ||
                 strstr(buf, "+QHTTPREAD:")) {

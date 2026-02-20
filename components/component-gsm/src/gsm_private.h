@@ -21,10 +21,13 @@
 #define GSM_TAG "gsm"
 
 /* Uncomment to log all raw UART TX/RX bytes */
-#define GSM_LOG_RAW_UART
+// #define GSM_LOG_RAW_UART
 
 /* Uncomment to log per-phase timing for HTTP/HTTPS requests */
-#define GSM_LOG_HTTP_TIMING
+// #define GSM_LOG_HTTP_TIMING
+
+/* Uncomment to log per-phase timing for WebSocket operations */
+// #define GSM_LOG_WS_TIMING
 
 #define GSM_DEFAULT_RX_BUF_SIZE  4096
 #define GSM_RESP_BUF_SIZE        512
