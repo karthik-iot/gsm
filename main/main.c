@@ -295,45 +295,13 @@ static void step_stress_test(void)
     ESP_LOGI(TAG, "  Passed: %d/%d   Failed: %d/%d", pass, (int)NUM_TESTS, fail, (int)NUM_TESTS);
 }
 
-/* ── Step 7b: WSS stress test (enabled by #define TEST_WSS) ──────── */
+/* ── Step 7b: WSS periodic post_log (enabled by #define TEST_WSS) ── */
 #ifdef TEST_WSS
 
-typedef struct {
-    int    size;
-    int    send_ms;
-    int    recv_ms;
-    int    total_ms;
-    bool   ok;
-    int    err_code;
-} ws_result_t;
-
-static ws_result_t ws_results[NUM_TESTS];
-
-static char *build_ws_payload(int seq, int target_size)
+static void step_wss_post_log(void)
 {
-    char *buf = malloc(target_size + 1);
-    if (!buf) return NULL;
-
-    int hdr = snprintf(buf, target_size + 1,
-        "{\"id\":%d,\"method\":\"system.healthcheck\","
-        "\"params\":{\"size\":%d,\"data\":\"", seq, target_size);
-
-    int pad = target_size - hdr - 3;   /* 3 = "}} */
-    if (pad < 0) pad = 0;
-
-    memset(buf + hdr, 'A', pad);
-    buf[hdr + pad]     = '"';
-    buf[hdr + pad + 1] = '}';
-    buf[hdr + pad + 2] = '}';
-    buf[hdr + pad + 3] = '\0';
-    return buf;
-}
-
-static void step_wss_stress_test(void)
-{
-    ESP_LOGI(TAG, "──── Step 7: WSS Stress Test ────");
+    ESP_LOGI(TAG, "──── Step 7: WSS Post Log (1 msg/sec) ────");
     ESP_LOGI(TAG, "  Endpoint: wss://%s%s", WS_HOST, WS_PATH);
-    ESP_LOGI(TAG, "  Tests: %d payloads\n", (int)NUM_TESTS);
 
     /* Connect once */
     int64_t t0 = esp_timer_get_time();
@@ -346,90 +314,80 @@ static void step_wss_stress_test(void)
     }
     ESP_LOGI(TAG, "  WSS connected in %d ms\n", conn_ms);
 
-    /* Send payloads of different sizes */
-    for (int i = 0; i < (int)NUM_TESTS; i++) {
-        int size = payload_sizes[i];
-        ESP_LOGI(TAG, "━━━ Test %d/%d — %d bytes ━━━", i + 1, (int)NUM_TESTS, size);
+    const int size = 8192;
 
-        char *body = build_ws_payload(i + 1, size);
-        if (!body) {
-            ESP_LOGE(TAG, "  malloc failed");
-            ws_results[i] = (ws_result_t){ .size = size, .ok = false, .err_code = -99 };
-            continue;
+    int seq = 0;
+    int last_send_ms = 0;
+    int last_recv_ms = 0;
+    int last_total_ms = 0;
+
+    while (1) {
+        {
+            seq++;
+
+            /* Build payload — JSON header with timing, padded to target size */
+            char *payload = malloc(size + 1);
+            if (!payload) {
+                ESP_LOGE(TAG, "[%d] malloc failed for %d B", seq, size);
+                goto done;
+            }
+
+            int hdr = snprintf(payload, size + 1,
+                "{\"seq\":%d,\"size\":%d,\"last_send_ms\":%d,"
+                "\"last_recv_ms\":%d,\"last_total_ms\":%d,\"data\":\"",
+                seq, size, last_send_ms, last_recv_ms, last_total_ms);
+            int pad = size - hdr - 2;   /* 2 = "} */
+            if (pad < 0) pad = 0;
+            memset(payload + hdr, 'A', pad);
+            payload[hdr + pad]     = '"';
+            payload[hdr + pad + 1] = '}';
+            payload[hdr + pad + 2] = '\0';
+
+            /* Send */
+            int64_t ts = esp_timer_get_time();
+            gsm_err_t serr = gsm_ws_send_text(modem, 0, payload, 0);
+            last_send_ms = (int)((esp_timer_get_time() - ts) / 1000);
+            free(payload);
+
+            if (serr != GSM_OK) {
+                ESP_LOGW(TAG, "[%d] SEND FAIL err=%d (%d B) — continuing", seq, serr, size);
+                last_send_ms = -1;
+                last_recv_ms = -1;
+                last_total_ms = -1;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
+            /* Receive echo */
+            size_t rbuf_size = (size_t)(size + 64);
+            char *rbuf = calloc(1, rbuf_size);
+            if (!rbuf) {
+                ESP_LOGE(TAG, "[%d] rbuf malloc failed", seq);
+                goto done;
+            }
+
+            int64_t tr = esp_timer_get_time();
+            int n = gsm_ws_recv(modem, 0, rbuf, rbuf_size, 10000);
+            last_recv_ms = (int)((esp_timer_get_time() - tr) / 1000);
+            last_total_ms = last_send_ms + last_recv_ms;
+            free(rbuf);
+
+            if (n > 0) {
+                ESP_LOGI(TAG, "[%d] %5dB send=%dms recv=%dms total=%dms",
+                         seq, size, last_send_ms, last_recv_ms, last_total_ms);
+            } else {
+                ESP_LOGW(TAG, "[%d] RECV FAIL n=%d (%d B) send=%dms recv=%dms — continuing",
+                         seq, n, size, last_send_ms, last_recv_ms);
+                last_recv_ms = -1;
+                last_total_ms = -1;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-
-        /* Send */
-        int64_t ts = esp_timer_get_time();
-        gsm_err_t serr = gsm_ws_send_text(modem, 0, body, 0);
-        int send_ms = (int)((esp_timer_get_time() - ts) / 1000);
-        free(body);
-
-        if (serr != GSM_OK) {
-            int total_ms = (int)((esp_timer_get_time() - ts) / 1000);
-            ESP_LOGE(TAG, "  SEND FAIL (%d) %d ms", serr, send_ms);
-            ws_results[i] = (ws_result_t){ .size = size, .send_ms = send_ms,
-                                            .total_ms = total_ms,
-                                            .ok = false, .err_code = serr };
-            continue;
-        }
-
-        /* Receive — buffer sized to payload + overhead */
-        size_t rbuf_size = (size > 512) ? (size_t)(size + 64) : 512;
-        char *rbuf = calloc(1, rbuf_size);
-        if (!rbuf) {
-            ws_results[i] = (ws_result_t){ .size = size, .ok = false, .err_code = -99 };
-            continue;
-        }
-
-        int64_t tr = esp_timer_get_time();
-        int n = gsm_ws_recv(modem, 0, rbuf, rbuf_size, 10000);
-        int recv_ms = (int)((esp_timer_get_time() - tr) / 1000);
-        int total_ms = send_ms + recv_ms;
-
-        if (n > 0) {
-            ws_results[i] = (ws_result_t){
-                .size = size, .send_ms = send_ms, .recv_ms = recv_ms,
-                .total_ms = total_ms, .ok = true, .err_code = 0
-            };
-            ESP_LOGI(TAG, "  OK  send %d ms  recv %d ms  total %.1f s  resp %d B: %.80s",
-                     send_ms, recv_ms, total_ms / 1000.0f, n, rbuf);
-        } else {
-            ws_results[i] = (ws_result_t){
-                .size = size, .send_ms = send_ms, .recv_ms = recv_ms,
-                .total_ms = total_ms, .ok = false, .err_code = n
-            };
-            if (n == 0)
-                ESP_LOGW(TAG, "  RECV empty  send %d ms  recv %d ms", send_ms, recv_ms);
-            else
-                ESP_LOGE(TAG, "  RECV err=%d  send %d ms  recv %d ms", n, send_ms, recv_ms);
-        }
-
-        free(rbuf);
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
+done:
     gsm_ws_close(modem, 0);
-
-    /* Summary */
-    ESP_LOGI(TAG, "\n╔══════════════════════════════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║               WSS Stress Test Results                           ║");
-    ESP_LOGI(TAG, "╠══════════╦══════════╦══════════╦══════════╦═════════╦════════════╣");
-    ESP_LOGI(TAG, "║  Size    ║ Send(ms) ║ Recv(ms) ║ Total(s) ║ Status  ║   Error    ║");
-    ESP_LOGI(TAG, "╠══════════╬══════════╬══════════╬══════════╬═════════╬════════════╣");
-
-    int pass = 0, fail = 0;
-    for (int i = 0; i < (int)NUM_TESTS; i++) {
-        ESP_LOGI(TAG, "║  %5d B ║  %5d   ║  %5d   ║  %5.1f   ║  %s  ║     %4d   ║",
-                 ws_results[i].size, ws_results[i].send_ms, ws_results[i].recv_ms,
-                 ws_results[i].total_ms / 1000.0f,
-                 ws_results[i].ok ? " OK " : "FAIL", ws_results[i].err_code);
-        if (ws_results[i].ok) pass++; else fail++;
-    }
-
-    ESP_LOGI(TAG, "╚══════════╩══════════╩══════════╩══════════╩═════════╩════════════╝");
-    ESP_LOGI(TAG, "  Connect: %.1f s  Passed: %d/%d  Failed: %d/%d",
-             conn_ms / 1000.0f, pass, (int)NUM_TESTS, fail, (int)NUM_TESTS);
 }
 #endif /* TEST_WSS */
 
@@ -437,7 +395,7 @@ static void step_wss_stress_test(void)
 void app_main(void)
 {
 #ifdef TEST_WSS
-    ESP_LOGI(TAG, "=== GSM WebSocket Stress Test ===\n");
+    ESP_LOGI(TAG, "=== GSM WebSocket Post Log ===\n");
 #else
     ESP_LOGI(TAG, "=== GSM HTTPS POST Test ===\n");
 #endif
@@ -450,7 +408,7 @@ void app_main(void)
     if (!step_activate_pdp()) return;
 
 #ifdef TEST_WSS
-    step_wss_stress_test();
+    step_wss_post_log();
 #else
     step_stress_test();
 #endif

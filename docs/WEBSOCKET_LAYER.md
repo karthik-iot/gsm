@@ -627,6 +627,189 @@ arrived yet, it returns `+QSSLRECV: 0` immediately. The recv loop polls every
 
 ---
 
+### What Send Time (send_ms) Measures
+
+`send_ms` is measured in `main.c` around the `gsm_ws_send_text()` call. It covers
+the entire path from ESP32 to the cellular network:
+
+```
+                          gsm_ws_send_text()
+                                │
+                         ws_send_frame()
+                                │
+               ┌────────────────┼────────────────┐
+               │                                  │
+          total ≤ 1024 B                    total > 1024 B
+          (single shot)                     (chunked path)
+               │                                  │
+   ┌───────────┴───────────┐         ┌────────────┴────────────┐
+   │ 1. AT+QSSLSEND=0,N   │         │ For each 1024 B chunk:  │
+   │    wait for ">" prompt│         │  1. AT+QSSLSEND=0,1024 │
+   │ 2. UART write:        │         │     wait for ">" prompt │
+   │    header + masked    │         │  2. UART write: masked  │
+   │    payload            │         │     payload chunk       │
+   │ 3. Wait for "SEND OK" │         │  3. Wait for "SEND OK" │
+   │    (modem encrypts    │         │     (repeat for each    │
+   │    + TCP transmit)    │         │      chunk)             │
+   └───────────────────────┘         └─────────────────────────┘
+```
+
+**What's included in send_ms:**
+1. AT command prompt wait (~5-10 ms per chunk)
+2. UART serialization at 115200 baud (~0.087 ms/byte)
+3. Modem TLS encryption
+4. Modem TCP transmit to cellular network
+5. "SEND OK" response wait
+
+### Why Send Time Scales Linearly
+
+The bottleneck is the **UART at 115200 baud** (~11.5 KB/s). The data path is:
+
+```
+ESP32 → UART (115200) → Modem AT+QSSLSEND → TLS encrypt → cellular TX
+```
+
+Observed rate: **~0.1 ms per byte** (matching the 115200 baud theoretical limit):
+
+| Payload | Send(ms) | Rate (ms/B) |
+|---------|----------|-------------|
+| 100 B   | 16       | 0.16        |
+| 256 B   | 30       | 0.12        |
+| 512 B   | 52       | 0.10        |
+| 1024 B  | 111      | 0.11        |
+| 2048 B  | 212      | 0.10        |
+| 4096 B  | 413      | 0.10        |
+| 8192 B  | 815      | 0.10        |
+| 16384 B | 1622     | 0.10        |
+
+**Formula:** `send_ms ≈ 16 + (payload_bytes × 0.098)`
+
+For payloads >1024 B, the chunked send path adds per-chunk AT command overhead
+(~5-10 ms per `AT+QSSLSEND` round-trip), but this is small compared to UART time.
+
+---
+
+### What Recv Time (recv_ms) Measures
+
+`recv_ms` is measured in `main.c` around the `gsm_ws_recv()` call. It covers
+waiting for the server response + reading it from the modem:
+
+```
+                          gsm_ws_recv()
+                                │
+                    ┌───────────┴───────────┐
+                    │ Allocate raw buffer    │
+                    │ (payload + 16 bytes)   │
+                    └───────────┬───────────┘
+                                │
+                     ws_transport_recv()
+                    ┌───────────┴───────────┐
+                    │ Poll loop:            │
+                    │                       │
+                    │  AT+QSSLRECV=0,1460   │◄──┐
+                    │         │              │   │
+                    │    +QSSLRECV: N        │   │
+                    │         │              │   │
+                    │    N > 0?              │   │
+                    │   yes/    \no          │   │
+                    │   │        │           │   │
+                    │ copy     sleep 100ms ──┘   │
+                    │ data       (retry)         │
+                    │   │                        │
+                    │ N < want?                  │
+                    │   yes → buffer drained     │
+                    │   no  → read more          │
+                    └───────────┬───────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │ Decode WS frame       │
+                    │ (parse header, unmask) │
+                    └───────────────────────┘
+```
+
+**What's included in recv_ms:**
+1. Network round-trip — waiting for server to receive, process, and reply
+2. Cellular uplink/downlink latency (50-300 ms, highly variable on 4G)
+3. Modem TLS decryption
+4. AT+QSSLRECV polling — each empty poll adds **100 ms** of dead time
+5. UART read (modem → ESP32)
+6. WebSocket frame header parsing and unmasking
+
+### Why Recv Time Is Unpredictable
+
+Recv time is governed by **4 stacked sources of jitter**:
+
+```
+recv_ms = network_rtt + server_processing + poll_overhead + uart_read
+
+         ┌─────────────────────────────────────────────────┐
+         │             Sources of recv jitter               │
+         ├──────────────────────┬──────────────────────────┤
+         │ 1. Cellular latency  │ 50-300ms per packet,     │
+         │    (dominant)        │ can spike to 500ms+      │
+         │                      │ depending on signal,     │
+         │                      │ congestion, handover     │
+         ├──────────────────────┼──────────────────────────┤
+         │ 2. Server echo time  │ Varies with server load  │
+         │                      │ and response payload     │
+         ├──────────────────────┼──────────────────────────┤
+         │ 3. QSSLRECV polling  │ Each empty poll = +100ms │
+         │    (quantized)       │ of dead time. 3 empty    │
+         │                      │ polls = 300ms wasted     │
+         ├──────────────────────┼──────────────────────────┤
+         │ 4. Modem buffer      │ TLS record may arrive    │
+         │    fragmentation     │ in pieces; partial data  │
+         │                      │ → poll again → +100ms    │
+         └──────────────────────┴──────────────────────────┘
+```
+
+### Explaining the 4096 B Anomaly (55 ms recv)
+
+```
+╠══════════╬══════════╬══════════╣
+║   2048 B ║    212   ║    977   ║  send short  → recv waits for network
+║   4096 B ║    413   ║     55   ║  send long   → response already buffered!
+║   8192 B ║    815   ║   1894   ║  send longer → but response is also larger
+╠══════════╬══════════╬══════════╣
+```
+
+The 4096 B case has the **lowest recv time** because of a timing overlap:
+
+1. Sending 4096 B took **413 ms** (long enough for the server to start replying)
+2. While the ESP32 was still writing chunks to UART, the server had already:
+   - Received the full payload
+   - Processed it
+   - Sent the echo response back
+   - The modem had buffered the response in its internal buffer
+3. When `gsm_ws_recv()` was called, the data was **already waiting** in the modem
+4. First `AT+QSSLRECV` returned data immediately → no 100 ms poll delays
+
+Compare with 100 B (recv = 170 ms): send finished in only 16 ms — far too fast for
+the server to have replied. Recv had to poll and wait for the network round-trip.
+
+For 8192 B (recv = 1894 ms): although send took 815 ms, the server's echo response
+is also 8 KB, which takes longer to travel back over the cellular link and requires
+multiple `AT+QSSLRECV` calls with possible empty polls between them.
+
+### End-to-End Timing Model
+
+For a WebSocket echo (send N bytes, receive N bytes back), the total time is:
+
+```
+total_ms ≈ send_time + max(0, network_rtt - send_time) + recv_transfer_time
+
+Where:
+  send_time          ≈ 16 + (N × 0.098) ms       (UART-limited, predictable)
+  network_rtt        ≈ 200-1000 ms                (cellular, unpredictable)
+  recv_transfer_time ≈ (N / 1460) × AT_overhead   (chunked reads from modem)
+  AT_overhead        ≈ 15-30 ms per QSSLRECV call
+```
+
+**Key insight:** When `send_time > network_rtt`, the recv appears near-instant
+(the 4096 B case). When `send_time < network_rtt`, recv includes the wait.
+
+---
+
 ## Error Codes
 
 | Code | Name | Meaning |
@@ -703,7 +886,7 @@ SSL → wstest.iotready.com:443
 WSS connected in 15429 ms    (DNS + TCP + TLS + WS handshake, first connect)
 ```
 
-### Payload Tests
+### Payload Tests (Run 1)
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
@@ -723,11 +906,34 @@ WSS connected in 15429 ms    (DNS + TCP + TLS + WS handshake, first connect)
   Connect: 15.4 s  Passed: 8/8  Failed: 0/8
 ```
 
+### Payload Tests (Run 2)
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║               WSS Stress Test Results                           ║
+╠══════════╦══════════╦══════════╦══════════╦═════════╦════════════╣
+║  Size    ║ Send(ms) ║ Recv(ms) ║ Total(s) ║ Status  ║   Error    ║
+╠══════════╬══════════╬══════════╬══════════╬═════════╬════════════╣
+║    100 B ║     16   ║    170   ║    0.2   ║   OK   ║        0   ║
+║    256 B ║     30   ║    829   ║    0.9   ║   OK   ║        0   ║
+║    512 B ║     52   ║    847   ║    0.9   ║   OK   ║        0   ║
+║   1024 B ║    111   ║    987   ║    1.1   ║   OK   ║        0   ║
+║   2048 B ║    212   ║    977   ║    1.2   ║   OK   ║        0   ║
+║   4096 B ║    413   ║     55   ║    0.5   ║   OK   ║        0   ║
+║   8192 B ║    815   ║   1894   ║    2.7   ║   OK   ║        0   ║
+║  16384 B ║   1622   ║   2037   ║    3.7   ║   OK   ║        0   ║
+╚══════════╩══════════╩══════════╩══════════╩═════════╩════════════╝
+```
+
 ### Key Observations
 
 - **8/8 tests pass** — all payload sizes from 100B to 16KB work correctly
-- **Send scales linearly** with payload size (~100 ms per KB, due to UART + AT chunking)
+- **Send scales linearly** with payload size (~0.1 ms/byte, UART-limited at 115200 baud)
+- **Send formula:** `send_ms ≈ 16 + (payload_bytes × 0.098)` — predictable
+- **Recv time is unpredictable** — dominated by cellular network latency + QSSLRECV polling jitter
+- **4096 B anomaly** — recv is only ~50 ms because the 413 ms send time was long enough
+  for the server to echo back the response before `gsm_ws_recv()` was called (data already
+  in modem buffer → no polling delay). See "Explaining the 4096 B Anomaly" in Timing Breakdown.
 - **Connect is slow** on first use (15.4s) — dominated by DNS + TLS handshake over cellular
 - **Chunking kicks in** at 1024B+ (visible in logs as "Chunked send: N B total")
-- **Recv time** varies based on server response time and number of `AT+QSSLRECV` calls needed
 - **Test environment:** ESP-IDF v4.4.8, ESP32 rev 3.1, Quectel EC200U, Airtel 4G (India)
