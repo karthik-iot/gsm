@@ -406,6 +406,16 @@ gsm_err_t gsm_wss_connect(gsm_handle_t m, const char *host, uint16_t port,
     WS_T_PHASE();
 
     ESP_LOGI(WS_TAG, "SSL → %s:%d", host, port);
+
+    /* Force-close any leftover SSL socket before opening a new one.
+     * This prevents "socket already in use" after a prior failed connect. */
+    {
+        char ccmd[32];
+        snprintf(ccmd, sizeof(ccmd), "AT+QSSLCLOSE=%d", sock_id);
+        gsm_send_at(m, ccmd, "OK", 2000);          /* ignore error */
+    }
+    WS_CLR_SSL(sock_id);
+
     snprintf(cmd, sizeof(cmd),
              "AT+QSSLOPEN=%d,%d,%d,\"%s\",%d,0",
              ctx_id, ssl_ctx, sock_id, host, port);
@@ -419,6 +429,10 @@ gsm_err_t gsm_wss_connect(gsm_handle_t m, const char *host, uint16_t port,
     snprintf(expect, sizeof(expect), "+QSSLOPEN: %d,0", sock_id);
     if (!gsm_expect_urc(m, expect, 15000)) {
         ESP_LOGE(WS_TAG, "SSL connect failed");
+        /* Close the half-open SSL socket so it can be reused next time */
+        char ccmd[32];
+        snprintf(ccmd, sizeof(ccmd), "AT+QSSLCLOSE=%d", sock_id);
+        gsm_send_at(m, ccmd, "OK", 2000);
         return GSM_ERR_SSL;
     }
 

@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 #define TAG "gsm-test"
@@ -301,6 +302,27 @@ static void step_stress_test(void)
 /* ── Step 7b: WSS periodic post_log (enabled by #define TEST_WSS) ── */
 #ifdef TEST_WSS
 
+/* ── Recovery tuning ─────────────────────────────────────────────── */
+#define MAX_SEND_FAILS_BEFORE_RECONNECT  3
+#define MAX_RECV_FAILS_BEFORE_RECONNECT  10
+#define WS_PING_INTERVAL_SEC             30
+#define PDP_HEALTH_CHECK_INTERVAL_SEC    600   /* 10 min */
+#define HEAP_LOG_INTERVAL_SEC            60
+
+/* Level 1: WSS reconnect */
+#define L1_MAX_ATTEMPTS     5
+#define L1_BACKOFF_INIT_MS  5000
+#define L1_BACKOFF_MAX_MS   60000
+
+/* Level 2: PDP reactivation */
+#define L2_MAX_ATTEMPTS     3
+
+/* Level 3: Modem reboot */
+#define L3_MAX_ATTEMPTS     3
+#define L3_COOLDOWN_MS      300000   /* 5 min between full reboot cycles */
+
+/* ── Helpers ─────────────────────────────────────────────────────── */
+
 static bool wss_connect(int *conn_ms)
 {
     int64_t t0 = esp_timer_get_time();
@@ -315,29 +337,177 @@ static bool wss_connect(int *conn_ms)
     return true;
 }
 
-static bool wss_reconnect(int *fail_streak)
+static void log_heap(void)
 {
-    ESP_LOGW(TAG, "  Reconnecting WSS (close → reopen)...");
-    gsm_ws_close(modem, 0);
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    ESP_LOGI(TAG, "[HEAP] free=%lu  min_ever=%lu",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)esp_get_minimum_free_heap_size());
+}
 
-    int conn_ms;
-    if (wss_connect(&conn_ms)) {
-        *fail_streak = 0;
-        return true;
+/** Check PDP context 1 is still active via AT+QIACT? */
+static bool pdp_is_active(void)
+{
+    char resp[256] = {0};
+    gsm_send_at_raw(modem, "AT+QIACT?");
+    int n = gsm_read_response(modem, resp, sizeof(resp), 2000);
+    return (n > 0 && strstr(resp, "+QIACT: 1"));
+}
+
+/* ── Level 1: WSS reconnect with exponential backoff ─────────────── */
+static bool recovery_level1(void)
+{
+    int backoff_ms = L1_BACKOFF_INIT_MS;
+
+    for (int attempt = 1; attempt <= L1_MAX_ATTEMPTS; attempt++) {
+        ESP_LOGW(TAG, "[L1] WSS reconnect attempt %d/%d", attempt, L1_MAX_ATTEMPTS);
+
+        gsm_ws_close(modem, 0);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        int conn_ms;
+        if (wss_connect(&conn_ms)) {
+            ESP_LOGI(TAG, "[L1] Reconnected on attempt %d", attempt);
+            return true;
+        }
+
+        ESP_LOGW(TAG, "[L1] Failed — backoff %d ms", backoff_ms);
+        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+        if (backoff_ms < L1_BACKOFF_MAX_MS)
+            backoff_ms *= 2;
+        if (backoff_ms > L1_BACKOFF_MAX_MS)
+            backoff_ms = L1_BACKOFF_MAX_MS;
     }
+
+    ESP_LOGE(TAG, "[L1] All %d WSS reconnect attempts failed", L1_MAX_ATTEMPTS);
     return false;
 }
 
-#define MAX_SEND_FAILS_BEFORE_RECONNECT 3
+/* ── Level 2: PDP reactivation ───────────────────────────────────── */
+static bool recovery_level2(void)
+{
+    for (int attempt = 1; attempt <= L2_MAX_ATTEMPTS; attempt++) {
+        ESP_LOGW(TAG, "[L2] PDP reactivation attempt %d/%d", attempt, L2_MAX_ATTEMPTS);
+
+        gsm_ws_close(modem, 0);
+
+        ESP_LOGI(TAG, "[L2] Deactivating PDP context 1...");
+        gsm_deactivate_pdp(modem, 1);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+
+        ESP_LOGI(TAG, "[L2] Reactivating PDP context 1...");
+        if (!step_activate_pdp()) {
+            ESP_LOGE(TAG, "[L2] PDP reactivation failed");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        int conn_ms;
+        if (wss_connect(&conn_ms)) {
+            ESP_LOGI(TAG, "[L2] Reconnected after PDP reactivation");
+            return true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    ESP_LOGE(TAG, "[L2] All %d PDP reactivation attempts failed", L2_MAX_ATTEMPTS);
+    return false;
+}
+
+/* ── Level 3: Full modem reboot ──────────────────────────────────── */
+static bool recovery_level3(void)
+{
+    for (int attempt = 1; attempt <= L3_MAX_ATTEMPTS; attempt++) {
+        ESP_LOGE(TAG, "[L3] Modem reboot attempt %d/%d", attempt, L3_MAX_ATTEMPTS);
+
+        gsm_ws_close(modem, 0);
+
+        ESP_LOGI(TAG, "[L3] Rebooting modem (AT+CFUN=1,1)...");
+        gsm_reboot(modem);
+        /* gsm_reboot already waits 5s for the modem to come back */
+
+        ESP_LOGI(TAG, "[L3] Re-syncing modem...");
+        if (!step_begin_modem()) {
+            ESP_LOGE(TAG, "[L3] Modem sync failed");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        step_diagnostics();
+
+        ESP_LOGI(TAG, "[L3] Waiting for network...");
+        if (!step_wait_network()) {
+            ESP_LOGE(TAG, "[L3] Network registration failed");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "[L3] Attaching data...");
+        if (!step_attach_data()) {
+            ESP_LOGE(TAG, "[L3] GPRS attach failed");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "[L3] Activating PDP...");
+        if (!step_activate_pdp()) {
+            ESP_LOGE(TAG, "[L3] PDP activation failed");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        int conn_ms;
+        if (wss_connect(&conn_ms)) {
+            ESP_LOGI(TAG, "[L3] Reconnected after modem reboot");
+            return true;
+        }
+
+        ESP_LOGE(TAG, "[L3] WSS connect failed after reboot — cooling down %d s",
+                 L3_COOLDOWN_MS / 1000);
+        vTaskDelay(pdMS_TO_TICKS(L3_COOLDOWN_MS));
+    }
+
+    ESP_LOGE(TAG, "[L3] All %d modem reboot attempts failed", L3_MAX_ATTEMPTS);
+    return false;
+}
+
+/**
+ * Escalating recovery: L1 → L2 → L3 → L3 cooldown loop.
+ * Returns true when WSS is back up.
+ */
+static bool full_recovery(void)
+{
+    if (recovery_level1()) return true;
+    if (recovery_level2()) return true;
+
+    /* L3 loops forever with cooldowns until the modem comes back */
+    while (1) {
+        if (recovery_level3()) return true;
+
+        ESP_LOGE(TAG, "[RECOVERY] All levels exhausted — cooling down %d s before retrying L3",
+                 L3_COOLDOWN_MS / 1000);
+        log_heap();
+        vTaskDelay(pdMS_TO_TICKS(L3_COOLDOWN_MS));
+    }
+}
+
+/* ── Main WSS stress loop ────────────────────────────────────────── */
 
 static void step_wss_post_log(void)
 {
     ESP_LOGI(TAG, "──── Step 7: WSS Post Log (1 msg/sec) ────");
     ESP_LOGI(TAG, "  Endpoint: wss://%s%s", WS_HOST, WS_PATH);
+    log_heap();
 
     int conn_ms;
-    if (!wss_connect(&conn_ms)) return;
+    if (!wss_connect(&conn_ms)) {
+        ESP_LOGW(TAG, "Initial connect failed — entering recovery");
+        if (!full_recovery()) return;   /* should not happen (L3 loops) */
+    }
 
     const int size = 8192;
 
@@ -346,115 +516,158 @@ static void step_wss_post_log(void)
     int last_recv_ms = 0;
     int last_total_ms = 0;
     int send_fail_streak = 0;
+    int recv_fail_streak = 0;
+
+    int64_t last_ping_us   = esp_timer_get_time();
+    int64_t last_pdp_chk   = esp_timer_get_time();
+    int64_t last_heap_log   = esp_timer_get_time();
 
     while (1) {
-        {
-            seq++;
+        seq++;
+        int64_t now_us = esp_timer_get_time();
 
-            /* Auto-reconnect after consecutive send failures */
-            if (send_fail_streak >= MAX_SEND_FAILS_BEFORE_RECONNECT) {
-                ESP_LOGW(TAG, "[%d] %d consecutive send failures — reconnecting",
-                         seq, send_fail_streak);
-                if (!wss_reconnect(&send_fail_streak)) {
-                    ESP_LOGE(TAG, "[%d] Reconnect failed — retrying in 5s", seq);
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                    continue;
-                }
-            }
-
-            /* Build payload using cJSON */
-            cJSON *root = cJSON_CreateObject();
-            if (!root) {
-                ESP_LOGW(TAG, "[%d] cJSON alloc failed — retrying", seq);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-            cJSON_AddNumberToObject(root, "seq", seq);
-            cJSON_AddNumberToObject(root, "size", size);
-            cJSON_AddNumberToObject(root, "last_send_ms", last_send_ms);
-            cJSON_AddNumberToObject(root, "last_recv_ms", last_recv_ms);
-            cJSON_AddNumberToObject(root, "last_total_ms", last_total_ms);
-
-            /* Pad data field to reach target size */
-            char *json_no_pad = cJSON_PrintUnformatted(root);
-            int meta_len = strlen(json_no_pad);
-            cJSON_free(json_no_pad);
-
-            /* overhead: ,"data":"" = 10 chars added by cJSON */
-            int pad_len = size - meta_len - 10;
-            if (pad_len < 1) pad_len = 1;
-
-            char *pad_str = malloc(pad_len + 1);
-            if (!pad_str) {
-                cJSON_Delete(root);
-                ESP_LOGW(TAG, "[%d] pad alloc failed — retrying", seq);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-            memset(pad_str, 'A', pad_len);
-            pad_str[pad_len] = '\0';
-
-            cJSON_AddStringToObject(root, "data", pad_str);
-            free(pad_str);
-
-            char *payload = cJSON_PrintUnformatted(root);
-            cJSON_Delete(root);
-            if (!payload) {
-                ESP_LOGW(TAG, "[%d] cJSON print failed — retrying", seq);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-
-            /* Send */
-            int64_t ts = esp_timer_get_time();
-            gsm_err_t serr = gsm_ws_send_text(modem, 0, payload, 0);
-            last_send_ms = (int)((esp_timer_get_time() - ts) / 1000);
-            cJSON_free(payload);
-
-            if (serr != GSM_OK) {
-                send_fail_streak++;
-                ESP_LOGW(TAG, "[%d] SEND FAIL err=%d (%d B) streak=%d — continuing",
-                         seq, serr, size, send_fail_streak);
-                last_send_ms = -1;
-                last_recv_ms = -1;
-                last_total_ms = -1;
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-            send_fail_streak = 0;
-
-            /* Receive echo */
-            size_t rbuf_size = (size_t)(size + 64);
-            char *rbuf = calloc(1, rbuf_size);
-            if (!rbuf) {
-                ESP_LOGW(TAG, "[%d] rbuf alloc failed — continuing", seq);
-                last_recv_ms = -1;
-                last_total_ms = -1;
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-
-            int64_t tr = esp_timer_get_time();
-            int n = gsm_ws_recv(modem, 0, rbuf, rbuf_size, 10000);
-            last_recv_ms = (int)((esp_timer_get_time() - tr) / 1000);
-            last_total_ms = last_send_ms + last_recv_ms;
-            free(rbuf);
-
-            if (n > 0) {
-                ESP_LOGI(TAG, "[%d] %5dB send=%dms recv=%dms total=%dms",
-                         seq, size, last_send_ms, last_recv_ms, last_total_ms);
-            } else {
-                ESP_LOGW(TAG, "[%d] RECV FAIL n=%d (%d B) send=%dms recv=%dms — continuing",
-                         seq, n, size, last_send_ms, last_recv_ms);
-                last_recv_ms = -1;
-                last_total_ms = -1;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        /* ── Periodic heap logging ────────────────────────────── */
+        if ((now_us - last_heap_log) / 1000000 >= HEAP_LOG_INTERVAL_SEC) {
+            log_heap();
+            last_heap_log = now_us;
         }
-    }
 
-    gsm_ws_close(modem, 0);
+        /* ── Periodic PDP health check ────────────────────────── */
+        if ((now_us - last_pdp_chk) / 1000000 >= PDP_HEALTH_CHECK_INTERVAL_SEC) {
+            last_pdp_chk = now_us;
+            if (!pdp_is_active()) {
+                ESP_LOGE(TAG, "[%d] PDP context lost — entering recovery", seq);
+                full_recovery();
+                send_fail_streak = 0;
+                recv_fail_streak = 0;
+                last_ping_us = esp_timer_get_time();
+                continue;
+            }
+            ESP_LOGI(TAG, "[%d] PDP health check OK", seq);
+        }
+
+        /* ── Periodic WebSocket PING ──────────────────────────── */
+        if ((now_us - last_ping_us) / 1000000 >= WS_PING_INTERVAL_SEC) {
+            gsm_err_t perr = gsm_ws_ping(modem, 0);
+            if (perr != GSM_OK) {
+                ESP_LOGW(TAG, "[%d] WS PING failed (err=%d)", seq, perr);
+                send_fail_streak++;
+            } else {
+                ESP_LOGD(TAG, "[%d] WS PING OK", seq);
+            }
+            last_ping_us = esp_timer_get_time();
+        }
+
+        /* ── Check if reconnect needed ────────────────────────── */
+        bool need_reconnect = (send_fail_streak >= MAX_SEND_FAILS_BEFORE_RECONNECT) ||
+                              (recv_fail_streak >= MAX_RECV_FAILS_BEFORE_RECONNECT);
+
+        if (need_reconnect) {
+            ESP_LOGW(TAG, "[%d] Reconnect trigger: send_fails=%d recv_fails=%d",
+                     seq, send_fail_streak, recv_fail_streak);
+            full_recovery();
+            send_fail_streak = 0;
+            recv_fail_streak = 0;
+            last_ping_us = esp_timer_get_time();
+            last_pdp_chk = esp_timer_get_time();
+            continue;
+        }
+
+        /* ── Build payload ────────────────────────────────────── */
+        cJSON *root = cJSON_CreateObject();
+        if (!root) {
+            ESP_LOGW(TAG, "[%d] cJSON alloc failed — retrying", seq);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        cJSON_AddNumberToObject(root, "seq", seq);
+        cJSON_AddNumberToObject(root, "size", size);
+        cJSON_AddNumberToObject(root, "last_send_ms", last_send_ms);
+        cJSON_AddNumberToObject(root, "last_recv_ms", last_recv_ms);
+        cJSON_AddNumberToObject(root, "last_total_ms", last_total_ms);
+
+        char *json_no_pad = cJSON_PrintUnformatted(root);
+        int meta_len = strlen(json_no_pad);
+        cJSON_free(json_no_pad);
+
+        int pad_len = size - meta_len - 10;
+        if (pad_len < 1) pad_len = 1;
+
+        char *pad_str = malloc(pad_len + 1);
+        if (!pad_str) {
+            cJSON_Delete(root);
+            ESP_LOGW(TAG, "[%d] pad alloc failed — retrying", seq);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        memset(pad_str, 'A', pad_len);
+        pad_str[pad_len] = '\0';
+
+        cJSON_AddStringToObject(root, "data", pad_str);
+        free(pad_str);
+
+        char *payload = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (!payload) {
+            ESP_LOGW(TAG, "[%d] cJSON print failed — retrying", seq);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* ── Send ─────────────────────────────────────────────── */
+        int64_t ts = esp_timer_get_time();
+        gsm_err_t serr = gsm_ws_send_text(modem, 0, payload, 0);
+        last_send_ms = (int)((esp_timer_get_time() - ts) / 1000);
+        cJSON_free(payload);
+
+        if (serr != GSM_OK) {
+            send_fail_streak++;
+            ESP_LOGW(TAG, "[%d] SEND FAIL err=%d (%d B) streak=%d",
+                     seq, serr, size, send_fail_streak);
+            last_send_ms = -1;
+            last_recv_ms = -1;
+            last_total_ms = -1;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        send_fail_streak = 0;
+
+        /* ── Receive echo ─────────────────────────────────────── */
+        size_t rbuf_size = (size_t)(size + 64);
+        char *rbuf = calloc(1, rbuf_size);
+        if (!rbuf) {
+            ESP_LOGW(TAG, "[%d] rbuf alloc failed — continuing", seq);
+            last_recv_ms = -1;
+            last_total_ms = -1;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        int64_t tr = esp_timer_get_time();
+        int n = gsm_ws_recv(modem, 0, rbuf, rbuf_size, 10000);
+        last_recv_ms = (int)((esp_timer_get_time() - tr) / 1000);
+        last_total_ms = last_send_ms + last_recv_ms;
+        free(rbuf);
+
+        if (n == -2) {
+            /* Server sent CLOSE frame — immediate reconnect */
+            ESP_LOGW(TAG, "[%d] Server sent CLOSE — reconnecting", seq);
+            send_fail_streak = MAX_SEND_FAILS_BEFORE_RECONNECT;
+            continue;
+        } else if (n > 0) {
+            recv_fail_streak = 0;
+            ESP_LOGI(TAG, "[%d] %5dB send=%dms recv=%dms total=%dms",
+                     seq, size, last_send_ms, last_recv_ms, last_total_ms);
+        } else {
+            recv_fail_streak++;
+            ESP_LOGW(TAG, "[%d] RECV FAIL n=%d (%d B) streak=%d send=%dms recv=%dms",
+                     seq, n, size, recv_fail_streak, last_send_ms, last_recv_ms);
+            last_recv_ms = -1;
+            last_total_ms = -1;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
 #endif /* TEST_WSS */
 
