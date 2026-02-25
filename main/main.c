@@ -97,6 +97,14 @@ static void step_diagnostics(void)
         ESP_LOGW(TAG, "  SIM: Not ready");
     }
 
+    /* SIM number (MSISDN) */
+    char sim_num[32] = {0};
+    if (gsm_get_sim_number(modem, sim_num, sizeof(sim_num))) {
+        ESP_LOGI(TAG, "  SIM Number: %s", sim_num);
+    } else {
+        ESP_LOGW(TAG, "  SIM Number: not available (normal for many carriers)");
+    }
+
     /* Signal strength */
     int csq = gsm_get_signal_strength(modem);
     if (csq >= 0) {

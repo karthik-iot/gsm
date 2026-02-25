@@ -509,6 +509,38 @@ bool gsm_get_imei(gsm_handle_t m, char *buf, size_t len)
     return true;
 }
 
+bool gsm_get_sim_number(gsm_handle_t m, char *buf, size_t len)
+{
+    gsm_flush_input(m);
+    gsm_uart_writeln(m, "AT+CNUM");
+    char resp[256];
+    gsm_read_response(m, resp, sizeof(resp), 2000);
+
+    /* +CNUM: "","+919876543210",145 — number is the second quoted string */
+    const char *p = strstr(resp, "+CNUM:");
+    if (!p) return false;
+
+    /* Skip first quoted string (alpha tag) */
+    const char *q1 = strchr(p, '"');
+    if (!q1) return false;
+    q1 = strchr(q1 + 1, '"');   /* end of first quoted string */
+    if (!q1) return false;
+
+    /* Extract second quoted string (the number) */
+    const char *start = strchr(q1 + 1, '"');
+    if (!start) return false;
+    start++;
+
+    const char *end = strchr(start, '"');
+    if (!end || end == start) return false;
+
+    size_t n = end - start;
+    if (n >= len) n = len - 1;
+    memcpy(buf, start, n);
+    buf[n] = '\0';
+    return true;
+}
+
 int gsm_get_signal_strength(gsm_handle_t m)
 {
     gsm_uart_writeln(m, "AT+CSQ");

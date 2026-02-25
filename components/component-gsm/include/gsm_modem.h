@@ -140,6 +140,9 @@ bool gsm_is_sim_ready(gsm_handle_t modem);
 /** Write IMEI into buf. Returns true on success. */
 bool gsm_get_imei(gsm_handle_t modem, char *buf, size_t len);
 
+/** Write subscriber number (MSISDN) into buf via AT+CNUM. Returns true on success. */
+bool gsm_get_sim_number(gsm_handle_t modem, char *buf, size_t len);
+
 /** Signal strength (CSQ value 0-31, or -1 on error). */
 int gsm_get_signal_strength(gsm_handle_t modem);
 
