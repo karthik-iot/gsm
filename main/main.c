@@ -485,11 +485,12 @@ static bool recovery_level3(void)
 
 /**
  * Escalating recovery: L1 → L2 → L3 → L3 cooldown loop.
+ * @param skip_l1  true to skip WSS reconnect (e.g. when PDP is known down).
  * Returns true when WSS is back up.
  */
-static bool full_recovery(void)
+static bool full_recovery(bool skip_l1)
 {
-    if (recovery_level1()) return true;
+    if (!skip_l1 && recovery_level1()) return true;
     if (recovery_level2()) return true;
 
     /* L3 loops forever with cooldowns until the modem comes back */
@@ -514,7 +515,7 @@ static void step_wss_post_log(void)
     int conn_ms;
     if (!wss_connect(&conn_ms)) {
         ESP_LOGW(TAG, "Initial connect failed — entering recovery");
-        if (!full_recovery()) return;   /* should not happen (L3 loops) */
+        if (!full_recovery(false)) return;   /* should not happen (L3 loops) */
     }
 
     const int size = 8192;
@@ -544,8 +545,8 @@ static void step_wss_post_log(void)
         if ((now_us - last_pdp_chk) / 1000000 >= PDP_HEALTH_CHECK_INTERVAL_SEC) {
             last_pdp_chk = now_us;
             if (!pdp_is_active()) {
-                ESP_LOGE(TAG, "[%d] PDP context lost — entering recovery", seq);
-                full_recovery();
+                ESP_LOGE(TAG, "[%d] PDP context lost — skipping L1, entering L2 recovery", seq);
+                full_recovery(true);
                 send_fail_streak = 0;
                 recv_fail_streak = 0;
                 last_ping_us = esp_timer_get_time();
@@ -573,7 +574,7 @@ static void step_wss_post_log(void)
         if (need_reconnect) {
             ESP_LOGW(TAG, "[%d] Reconnect trigger: send_fails=%d recv_fails=%d",
                      seq, send_fail_streak, recv_fail_streak);
-            full_recovery();
+            full_recovery(false);
             send_fail_streak = 0;
             recv_fail_streak = 0;
             last_ping_us = esp_timer_get_time();
