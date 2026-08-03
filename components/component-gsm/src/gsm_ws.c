@@ -394,8 +394,9 @@ gsm_err_t gsm_wss_connect(gsm_handle_t m, const char *host, uint16_t port,
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ciphersuite\",%d,0xFFFF", ssl_ctx);
     gsm_send_at(m, cmd, "OK", 1000);
 
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"seclevel\",%d,0", ssl_ctx);
-    gsm_send_at(m, cmd, "OK", 1000);
+    /* CA-verified handshake: checks the server cert against the CA
+     * already uploaded to the modem as "cacert.pem". */
+    gsm_ssl_configure(m, ssl_ctx, "cacert.pem", true);
 
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"sni\",%d,1", ssl_ctx);
     gsm_send_at(m, cmd, "OK", 1000);
